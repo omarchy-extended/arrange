@@ -1,0 +1,135 @@
+# omext arrange
+
+Part of [**omarchy-extended**](https://github.com/omarchy-extended): addons for [Omarchy](https://omarchy.org).
+
+Window layouts and snap zones for Omarchy. Save how your windows sit across all
+your screens and get it back in one click. And snap floating windows into zones
+of a screen: halves, thirds, a wide middle, or sets you draw yourself.
+
+![The Arrange menu: layouts on the left, the screen's zones on the right](screenshots/arrange-menu.webp)
+
+## Layouts
+
+- **Save** the visible workspaces on every screen as a layout: each window's
+  place, each workspace's Omarchy layout (floating, dwindle or scrolling), and
+  each screen's zone set.
+- **Apply** a layout: the windows go back where they were. Apps that aren't
+  running are started first. Floating windows go back into their zones; tiled
+  workspaces get their split back.
+  Windows that aren't in the layout are put away. An app of an
+  [omext dock](https://github.com/omarchy-extended/docks) goes back into its
+  dock (so a layout saved with it docked has it docked again). On a floating workspace
+  each of the rest is made to fit its screen (one larger than the screen fills it, one
+  hanging off an edge moves back on) and minimized, a click from back; on a
+  tiled one they go to a spare workspace. A layout's own window that comes
+  out larger than its screen fills it.
+- **Reset** puts the current layout back after you've moved things around.
+  **Update** saves over it.
+- Each layout has a bar icon, and can have a keyboard shortcut:
+  `omext-layout key <id> "SUPER + ALT + 1"`.
+- With [omext docks](https://github.com/omarchy-extended/docks) installed,
+  a window that's in a dock is taken out of it when a layout wants it.
+
+## Zones
+
+- **Each screen has a zone set**: halves, thirds, focus (a wide middle),
+  wide left or right, quarters, sixths, focus stack, or one of your own. By
+  default wide screens get thirds and others halves.
+- **The zone picker** (Super + Z): an overlay of the screen's zones. Click a zone
+  to snap the window there, or drag across several to span them. Keys 1–9 snap
+  too. The row at the top switches the screen's set, and the editor draws new
+  ones.
+- **Super + Shift + arrows** move a floating window to the next zone, and onto
+  the next screen at the edge. On a tiled window they still swap, as in Omarchy.
+- **A snap bar** shows while you drag a floating window: drop it on a zone, or
+  on Fill screen.
+  Drop it on the line between two zones and it covers both; where several
+  meet, all of them. The titlebar's map takes a click the same way.
+- **Hold Shift, then drag** and the zones show over the whole screen, each
+  where it is, in place of the bar: drop the window where it's to go (on a line
+  between zones, across them; on a dock's strip along its edge, into the dock).
+  Let go of Shift before the button and the snap is off. (Shift goes down
+  before the drag starts: Hyprland lets go of a dragged window at any key.)
+- A dragged window is dropped when the button is let go of, not while it's
+  held still.
+- **A ▦ titlebar button** on floating windows opens a small map of the zones at
+  the pointer.
+- **With [omext docks](https://github.com/omarchy-extended/docks):** the snap
+  bar and the ▦ map show each screen's docks beside its zones, on the side
+  they're on. Drop the window there (or click it) and it goes into that dock.
+- **Magnet:** a dragged floating window snaps against screen edges and other
+  windows, keeping the gaps.
+- **Gaps:** zones follow Omarchy's gaps and borders, so snapped windows line up
+  the way tiled ones do (titlebar included). With gaps off they sit edge to edge.
+
+![The zone picker (Super + Z) over three snapped windows](screenshots/zone-picker.webp)
+
+![Dragging a window: the snap bar at the top, zone 2 lit under the pointer](screenshots/snap-bar.webp)
+
+![The ▦ titlebar button's zone map](screenshots/titlebar-map.webp)
+
+![The zone editor: click to split, drag to resize or join](screenshots/zone-editor.webp)
+
+An app with a minimum size larger than its zone stays at that size and runs
+into the next zone (Omawrite won't go below 720 pixels wide, a third of a
+1920-pixel screen is about 620). Give such apps a wider zone, or span two.
+
+## The Arrange bar widget
+
+One menu for both: your layouts with a preview of every screen (click one, or
+press its number, to apply it), Save and Update, and each screen's zones (click
+a zone to put the active window there, or pick another set).
+
+## Compatibility
+
+Needs **Omarchy 4.5** or later (tested on 4.5.0): it builds on its floating
+workspaces, titlebars and shell plugins.
+
+Made for, and tested on, Omarchy's **floating** workspace layout:
+
+```bash
+omarchy hyprland workspace layout default floating
+```
+
+Layouts also save and restore dwindle and scrolling workspaces, but those
+layouts are less tested, and nothing is guaranteed there.
+
+Arrange takes over **Super + Z** and **Super + Shift + arrows** (the latter
+only for floating windows), and turns on Hyprland's window snapping.
+
+## Install
+
+You need Omarchy 4.5 or later, with `python`.
+
+```bash
+git clone https://github.com/omarchy-extended/arrange.git ~/.local/share/omext-arrange
+~/.local/share/omext-arrange/install.sh
+```
+
+The install links the files from the clone, so `git pull` there updates it. It:
+
+- links `omext-layout` and `omext-zone` into `~/.local/bin`;
+- links the shell plugins `omext.arrange` (the bar widget) and `omext.zones`
+  (the zone picker) into `~/.config/omarchy/plugins`, and turns them on;
+- adds a marked block to `~/.config/hypr/hyprland.lua`, which loads `hypr/*.lua`
+  (the keys, the titlebar button, the snap bar and the magnet).
+
+`./uninstall.sh` removes all of this. Your layouts and zone sets stay in
+`~/.config/omext/`.
+
+## Files
+
+| Path | What it is |
+|------|------------|
+| `bin/omext-layout` | Saves, lists, applies and removes layouts (`omext-layout --help`). |
+| `bin/omext-zone` | Zone sets, snapping and the picker (`omext-zone --help`). |
+| `plugins/omext.arrange/` | The Arrange bar widget. |
+| `plugins/omext.zones/` | The zone picker, editor and snap bar. |
+| `hypr/*.lua` | Keys, the titlebar button, the drag watcher and the magnet. |
+| `install.sh`, `uninstall.sh` | The standalone install. |
+| `~/.config/omext/layouts/` | Your layouts (`OMEXT_LAYOUTS_DIR` overrides it). |
+| `~/.config/omext/zones.json` | Each screen's zone set; `zone-sets.json` and `zone-hidden.json` beside it (`OMEXT_ZONES_FILE` overrides). |
+
+## License
+
+MIT

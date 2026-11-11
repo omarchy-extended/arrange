@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "omext.zones",
+  "name": "Zone picker",
+  "version": "1.0.0",
+  "author": "omarchy-extended",
+  "license": "MIT",
+  "description": "Zone picker and editor (omext arrange): opened from the Arrange bar widget, Super + Z or a window's titlebar; a snap bar shows while a window is dragged.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

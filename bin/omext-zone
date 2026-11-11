@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""FancyZones-style zones for floating windows.
+
+Usage:
+  omext-zone list                        JSON: the zone sets, and each screen's set and zones
+  omext-zone snap <n>[,<m>...] [--window ADDR] [--monitor NAME]
+                                       put the window in zone n (1-based), or across several,
+                                       of its screen or the one named
+  omext-zone move left|right|up|down [--window ADDR]
+                                       to the next zone that way, onto the next screen at the
+                                       edge; a tiled window is swapped instead, as before
+  omext-zone use <set> [--monitor NAME]  give a screen (default: the focused one) another set
+  omext-zone pick [--window ADDR] [--screen NAME] [--edit copy|new]
+                                       open the zone picker for the window, on its screen or
+                                       the one named (where the window then goes); with
+                                       --edit, the editor on that screen: its set (a copy of
+                                       a built-in one), or a new blank one
+  omext-zone quick [--window ADDR]       a small map of the window's screen's zones at the
+                                       pointer (the titlebar button): click one to put the
+                                       window there
+  omext-zone save <name> <zones> [--monitor NAME]
+                                       keep a set of your own (zones as JSON, [[x, y, w, h], ...]
+                                       in fractions of the free area), and give it to the screen
+  omext-zone delete <name>               drop a set of your own
+  omext-zone hide|show <name>            leave a set out of the picker's row, or put it back
+
+Without --window it is the active window. Each screen has one set of zones, by
+default "thirds" on wide screens and "halves" on the others; the choice is kept
+per screen in ~/.config/omext/zones.json (keyed by the screen's description;
+OMEXT_ZONES_FILE overrides). Sets of your own (made in the picker's editor) are
+in zone-sets.json beside it, and the sets left out of the picker in zone-hidden.json.
+Zones are fractions of the screen's free area (inside the bar and outer gaps,
+and a workspace's own outer gaps), spaced by the inner gaps.
+Snapping floats a tiled window.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# The settings files, read and written omext core's way (as every omext tool does).
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy/plugins/omext.core"))
+try:
+    import omext_settings as settings
+except ImportError:
+    sys.exit("omext-zone: needs omext core (https://github.com/omarchy-extended/core)")
+
+CHOICES = Path(os.environ.get("OMEXT_ZONES_FILE") or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omext" / "zones.json")
+CUSTOM = CHOICES.parent / "zone-sets.json"
+HIDDEN = CHOICES.parent / "zone-hidden.json"
+
+# Each zone is [x, y, w, h] as fractions of the free area.
+SETS = {
+    "halves": [[0, 0, 1 / 2, 1], [1 / 2, 0, 1 / 2, 1]],
+    "thirds": [[0, 0, 1 / 3, 1], [1 / 3, 0, 1 / 3, 1], [2 / 3, 0, 1 / 3, 1]],
+    "focus": [[0, 0, 1 / 4, 1], [1 / 4, 0, 1 / 2, 1], [3 / 4, 0, 1 / 4, 1]],
+    "wide-left": [[0, 0, 2 / 3, 1], [2 / 3, 0, 1 / 3, 1]],
+    "wide-right": [[0, 0, 1 / 3, 1], [1 / 3, 0, 2 / 3, 1]],
+    "quarters": [[0, 0, 1 / 2, 1 / 2], [1 / 2, 0, 1 / 2, 1 / 2], [0, 1 / 2, 1 / 2, 1 / 2], [1 / 2, 1 / 2, 1 / 2, 1 / 2]],
+    "sixths": [[x / 3, y / 2, 1 / 3, 1 / 2] for y in range(2) for x in range(3)],
+    "focus-stack": [[0, 0, 1 / 4, 1 / 2], [0, 1 / 2, 1 / 4, 1 / 2], [1 / 4, 0, 1 / 2, 1],
+                    [3 / 4, 0, 1 / 4, 1 / 2], [3 / 4, 1 / 2, 1 / 4, 1 / 2]],
+}
+BUILT_IN = list(SETS)
+WIDE = 2560  # logical width from which a screen gets "thirds" by default
+DIRS = {"left": "l", "right": "r", "up": "u", "down": "d"}
+TITLEBAR_TAG = "omarchy-floating-workspace"  # Omarchy's hyprbars draw on windows with it
+
+
+def die(msg):
+    print(f"omext-zone: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def hypr(what):
+    return json.loads(subprocess.check_output(["hyprctl", what, "-j"]))
+
+
+def dispatch(expr):
+    subprocess.run(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def q(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def option(name):
+    try:
+        got = json.loads(subprocess.check_output(["hyprctl", "getoption", name, "-j"]))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+    return next((got[k] for k in ("custom", "css", "int") if k in got), None)
+
+
+def sides(value, fallback):
+    """Gaps as (top, right, bottom, left) from Hyprland's "10 10 10 10" or a number."""
+    try:
+        parts = [int(float(p)) for p in str(value).split()]
+    except ValueError:
+        parts = []
+    if not parts:
+        return (fallback,) * 4
+    return tuple((parts * 4)[:4]) if len(parts) == 1 else tuple((parts + parts[-1:] * 4)[:4])
+
+
+def read_json(path):
+    return settings.read(path, {})
+
+
+def write_json(path, value):
+    settings.write(path, value, sort_keys=True)
+
+
+def choices():
+    return read_json(CHOICES)
+
+
+def custom_sets():
+    return {k: v for k, v in read_json(CUSTOM).items() if k not in BUILT_IN and valid_zones(v)}
+
+
+def hidden():
+    got = read_json(HIDDEN)
+    return [n for n in got if n in SETS] if isinstance(got, list) else []
+
+
+def valid_zones(zs):
+    return isinstance(zs, list) and 0 < len(zs) <= 24 and all(
+        isinstance(z, list) and len(z) == 4 and all(isinstance(v, (int, float)) for v in z)
+        and z[0] >= 0 and z[1] >= 0 and z[2] > 0 and z[3] > 0
+        and z[0] + z[2] <= 1.0001 and z[1] + z[3] <= 1.0001 for z in zs)
+
+
+def logical(m):
+    w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+    return (h, w) if m.get("transform", 0) % 2 else (w, h)
+
+
+def set_of(m):
+    name = choices().get(m["description"])
+    if name in SETS:
+        return name
+    return "thirds" if logical(m)[0] >= WIDE else "halves"
+
+
+def free_area(m):
+    """The screen's free area in layout coordinates: inside its reserved space
+    (the bar), and the outer gaps (a workspace's own, if it has them)."""
+    lw, lh = logical(m)
+    left, top, right, bottom = m["reserved"]
+    out = sides(option("general:gaps_out"), 10)
+    ws = m["activeWorkspace"]["name"]
+    for rule in hypr("workspacerules"):
+        if rule.get("workspaceString") == ws and rule.get("gapsOut"):
+            out = tuple(rule["gapsOut"][:4])
+    gt, gr, gb, gl = out
+    return (m["x"] + left + gl, m["y"] + top + gt, lw - left - right - gl - gr, lh - top - bottom - gt - gb)
+
+
+def zones(m):
+    """The screen's zones as [x, y, w, h] in layout pixels, spaced by the inner gaps."""
+    ax, ay, aw, ah = free_area(m)
+    gap = sides(option("general:gaps_in"), 5)[0]
+    border = int(option("general:border_size") or 0)  # drawn outside the window, as when tiled
+    rects = []
+    for fx, fy, fw, fh in SETS[set_of(m)]:
+        x, y = ax + fx * aw, ay + fy * ah
+        x2, y2 = ax + (fx + fw) * aw, ay + (fy + fh) * ah
+        # Inner edges give half a gap each, so neighbours end up a full gap apart.
+        x += gap if fx > 0.001 else 0
+        y += gap if fy > 0.001 else 0
+        x2 -= gap if fx + fw < 0.999 else 0
+        y2 -= gap if fy + fh < 0.999 else 0
+        rects.append([round(x + border), round(y + border), round(x2 - x - 2 * border), round(y2 - y - 2 * border)])
+    return rects
+
+
+def union(rects):
+    x, y = min(r[0] for r in rects), min(r[1] for r in rects)
+    return [x, y, max(r[0] + r[2] for r in rects) - x, max(r[1] + r[3] for r in rects) - y]
+
+
+def overlap(a, b):
+    w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    return max(0, w) * max(0, h)
+
+
+def target(args):
+    """The window --window names, else the active one (None if there is none)."""
+    addr = None
+    if "--window" in args:
+        i = args.index("--window")
+        addr = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    if addr and not addr.startswith("0x"):
+        addr = "0x" + addr
+    if not addr:
+        return hypr("activewindow").get("address") and hypr("activewindow")
+    return next((c for c in hypr("clients") if c["address"] == addr), None)
+
+
+def monitor_of(c, monitors):
+    return next((m for m in monitors if m["id"] == c["monitor"]), monitors[0])
+
+
+def settled(address, wanted, timeout=0.6):
+    """The window's size once the client has answered a resize (some have a minimum)."""
+    last, end = None, time.monotonic() + timeout
+    while time.monotonic() < end:
+        c = next((x for x in hypr("clients") if x["address"] == address), None)
+        if not c:
+            break
+        if last == tuple(c["size"]):
+            return last
+        last = tuple(c["size"])
+        time.sleep(0.08)
+    return last or wanted
+
+
+def titlebar(c):
+    """Height of the titlebar Omarchy draws above windows on floating workspaces
+    (outside the window's own size), 0 for others."""
+    if TITLEBAR_TAG not in c.get("tags", []):
+        return 0
+    return int(option("plugin:hyprbars:bar_height") or 0)
+
+
+def frame(c):
+    """The window as it looks: its titlebar included."""
+    bar = titlebar(c)
+    return [c["at"][0], c["at"][1] - bar, c["size"][0], c["size"][1] + bar]
+
+
+def place(c, rect):
+    addr = q("address:" + c["address"])
+    # As it is now: just moved to another workspace, Omarchy may have tiled it
+    # again (a tiled workspace) or given it a titlebar (a floating one).
+    time.sleep(0.1)
+    c = next((x for x in hypr("clients") if x["address"] == c["address"]), c)
+    if c.get("fullscreen"):
+        dispatch(f"hl.dsp.window.fullscreen({{ mode = 'maximized', action = 'unset', window = {addr} }})")
+    if not c["floating"]:
+        dispatch(f"hl.dsp.window.float({{ action = 'on', window = {addr} }})")
+    bar = titlebar(c)
+    x, y, w, h = rect[0], rect[1] + bar, rect[2], rect[3] - bar
+    dispatch(f"hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false, window = {addr} }})")
+    # One bigger than asked (a minimum size) is kept inside the zone where it fits.
+    rw, rh = settled(c["address"], (w, h))
+    dispatch(f"hl.dsp.window.move({{ x = {x + max(0, (w - rw) // 2)}, y = {y + max(0, (h - rh) // 2)}, relative = false, window = {addr} }})")
+    # A window sent to a zone lands on top of what's there, however it was sent
+    # (the map, the keys, a taskbar's icon, a layout).
+    dispatch(f"hl.dsp.window.alter_zorder({{ mode = 'top', window = {addr} }})")
+
+
+def cmd_list():
+    out = []
+    for m in hypr("monitors"):
+        out.append({"id": m["id"], "name": m["name"], "description": m["description"], "focused": m["focused"],
+                    "x": m["x"], "y": m["y"], "width": round(logical(m)[0]), "height": round(logical(m)[1]),
+                    "set": set_of(m), "area": [round(v) for v in free_area(m)], "zones": zones(m)})
+    print(json.dumps({"sets": SETS, "custom": list(custom_sets()), "hidden": hidden(), "monitors": out}))
+
+
+def cmd_snap(args):
+    c = target(args)
+    name = None
+    if "--monitor" in args:
+        i = args.index("--monitor")
+        name = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    if not c:
+        return
+    try:
+        picks = [int(n) for n in args[0].split(",")]
+    except (IndexError, ValueError):
+        die("snap needs zone numbers, e.g. 2 or 1,2")
+    monitors = hypr("monitors")
+    m = next((x for x in monitors if x["name"] == name), None) or monitor_of(c, monitors)
+    if m["id"] != c["monitor"]:
+        # Onto that screen's workspace first, as move does at the edge.
+        dispatch(f"hl.dsp.window.move({{ workspace = {q(m['activeWorkspace']['name'])}, follow = true, window = {q('address:' + c['address'])} }})")
+    rects = zones(m)
+    chosen = [rects[n - 1] for n in picks if 1 <= n <= len(rects)]
+    if chosen:
+        place(c, union(chosen))
+
+
+def cmd_move(args):
+    c = target(args)
+    if not args or args[0] not in DIRS:
+        die("move needs left, right, up or down")
+    d = args[0]
+    if not c:
+        return
+    if not c["floating"]:
+        # A tiled window keeps what these keys do in Omarchy.
+        dispatch(f"hl.dsp.window.swap({{ direction = '{DIRS[d]}' }})")
+        return
+    monitors = hypr("monitors")
+    m = monitor_of(c, monitors)
+    rects = zones(m)
+    win = frame(c)
+    # The zones it is in now: those it covers at least half of, else the one under its centre.
+    current = [r for r in rects if overlap(r, win) >= 0.5 * r[2] * r[3]]
+    if not current:
+        cx, cy = win[0] + win[2] / 2, win[1] + win[3] / 2
+        best = max(rects, key=lambda r: overlap(r, win) or -((r[0] + r[2] / 2 - cx) ** 2 + (r[1] + r[3] / 2 - cy) ** 2))
+        if best[:2] != win[:2] or best[2:] != win[2:]:
+            place(c, best)  # not in a zone yet: into the nearest one first
+            return
+        current = [best]
+    box = union(current)
+    nxt = neighbour(box, rects, d)
+    if nxt:
+        place(c, nxt)
+        return
+    # At the edge: onto the screen beyond, into its zone nearest to this one.
+    other = next_monitor(m, monitors, d)
+    if other:
+        # Onto that screen's workspace first: a window only placed there would
+        # still belong to this one.
+        dispatch(f"hl.dsp.window.move({{ workspace = {q(other['activeWorkspace']['name'])}, follow = true, window = {q('address:' + c['address'])} }})")
+        place(c, edge_zone(box, zones(other), d))
+
+
+def centre(r):
+    return r[0] + r[2] / 2, r[1] + r[3] / 2
+
+
+def neighbour(box, rects, d):
+    """The nearest zone beyond box in direction d that lines up with it."""
+    bx, by = centre(box)
+    found = []
+    for r in rects:
+        rx, ry = centre(r)
+        if d in ("left", "right"):
+            lined = min(r[1] + r[3], box[1] + box[3]) - max(r[1], box[1]) > 0
+            beyond = r[0] + r[2] <= box[0] + 2 if d == "left" else r[0] >= box[0] + box[2] - 2
+            dist = abs(rx - bx) + abs(ry - by) / 4
+        else:
+            lined = min(r[0] + r[2], box[0] + box[2]) - max(r[0], box[0]) > 0
+            beyond = r[1] + r[3] <= box[1] + 2 if d == "up" else r[1] >= box[1] + box[3] - 2
+            dist = abs(ry - by) + abs(rx - bx) / 4
+        if lined and beyond:
+            found.append((dist, r))
+    return min(found)[1] if found else None
+
+
+def next_monitor(m, monitors, d):
+    mx, my = m["x"], m["y"]
+    mw, mh = logical(m)
+    found = []
+    for o in monitors:
+        if o["id"] == m["id"]:
+            continue
+        ow, oh = logical(o)
+        if d == "left" and o["x"] + ow <= mx + 1:
+            found.append((mx - (o["x"] + ow), o))
+        elif d == "right" and o["x"] >= mx + mw - 1:
+            found.append((o["x"] - (mx + mw), o))
+        elif d == "up" and o["y"] + oh <= my + 1:
+            found.append((my - (o["y"] + oh), o))
+        elif d == "down" and o["y"] >= my + mh - 1:
+            found.append((o["y"] - (my + mh), o))
+    return min(found, key=lambda f: f[0])[1] if found else None
+
+
+def edge_zone(box, rects, d):
+    """Entering a screen going d: the zone on its near edge closest in height (or width)."""
+    if d in ("left", "right"):
+        edge = max(r[0] + r[2] for r in rects) if d == "left" else min(r[0] for r in rects)
+        near = [r for r in rects if (r[0] + r[2] == edge if d == "left" else r[0] == edge)]
+        return min(near, key=lambda r: abs(centre(r)[1] - centre(box)[1]))
+    edge = max(r[1] + r[3] for r in rects) if d == "up" else min(r[1] for r in rects)
+    near = [r for r in rects if (r[1] + r[3] == edge if d == "up" else r[1] == edge)]
+    return min(near, key=lambda r: abs(centre(r)[0] - centre(box)[0]))
+
+
+def give(set_name, args):
+    """Make set_name the set of the screen --monitor names (default: the focused one)."""
+    monitors = hypr("monitors")
+    name = None
+    if "--monitor" in args:
+        i = args.index("--monitor")
+        name = args[i + 1] if i + 1 < len(args) else None
+    m = next((x for x in monitors if x["name"] == name), None) if name else next((x for x in monitors if x["focused"]), None)
+    if not m:
+        die(f"no screen {name}")
+    picked = choices()
+    picked[m["description"]] = set_name
+    write_json(CHOICES, picked)
+
+
+def cmd_use(args):
+    if not args or args[0] not in SETS:
+        die("use needs one of: " + ", ".join(SETS))
+    give(args[0], args[1:])
+
+
+def cmd_save(args):
+    if len(args) < 2:
+        die("save needs a name and the zones")
+    name = args[0].strip()
+    if not re.fullmatch(r"[\w][\w -]{0,23}", name) or name in BUILT_IN:
+        die(f"{name!r} can't be used as a name (letters, digits, - and spaces, not a built-in set)")
+    try:
+        zs = [[round(float(v), 4) for v in z] for z in json.loads(args[1])]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        die("the zones must be JSON: [[x, y, w, h], ...]")
+    if not valid_zones(zs):
+        die("the zones must be 1-24 boxes of [x, y, w, h] inside 0..1")
+    sets = custom_sets()
+    sets[name] = zs
+    write_json(CUSTOM, sets)
+    give(name, args[2:])
+
+
+def cmd_hide(args, hide):
+    if not args or args[0] not in SETS:
+        die(("hide" if hide else "show") + " needs one of: " + ", ".join(SETS))
+    names = [n for n in hidden() if n != args[0]] + ([args[0]] if hide else [])
+    write_json(HIDDEN, names)
+
+
+def cmd_delete(args):
+    sets = custom_sets()
+    if not args or args[0] not in sets:
+        die("delete needs one of your own sets: " + ", ".join(sets))
+    del sets[args[0]]
+    write_json(CUSTOM, sets)
+    write_json(HIDDEN, [n for n in hidden() if n != args[0]])
+    # Screens that had it go back to their default.
+    write_json(CHOICES, {k: v for k, v in choices().items() if v != args[0]})
+
+
+def cmd_pick(args):
+    screen, how = None, None
+    if "--edit" in args:
+        i = args.index("--edit")
+        how = args[i + 1] if i + 1 < len(args) else ""
+        del args[i:i + 2]
+        if how not in ("copy", "new"):
+            die("--edit needs copy or new")
+    if "--screen" in args:
+        i = args.index("--screen")
+        screen = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    c = target(args)
+    if how:
+        name = screen or monitor_of(c, hypr("monitors"))["name"] if (screen or c) else None
+        if not name:
+            return
+        subprocess.run(["omarchy-shell", "omext.zones", "editOn", name, how],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    if screen:
+        # A screen without a window still opens: its sets can be changed and edited.
+        call = ["pickOn", c["address"] if c else "", screen]
+    elif c:
+        call = ["pick", c["address"]]
+    else:
+        return
+    subprocess.run(["omarchy-shell", "omext.zones", *call], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_quick(args):
+    c = target(args)
+    if not c:
+        return
+    m = monitor_of(c, hypr("monitors"))
+    p = hypr("cursorpos")
+    subprocess.run(["omarchy-shell", "omext.zones", "quick", c["address"], m["name"],
+                    str(round(p.get("x", 0))), str(round(p.get("y", 0)))],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    SETS.update(custom_sets())
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = args[0], args[1:]
+    commands = {"list": lambda: cmd_list(), "snap": lambda: cmd_snap(rest), "move": lambda: cmd_move(rest),
+                "use": lambda: cmd_use(rest), "pick": lambda: cmd_pick(rest),
+                "quick": lambda: cmd_quick(rest),
+                "save": lambda: cmd_save(rest), "delete": lambda: cmd_delete(rest),
+                "hide": lambda: cmd_hide(rest, True), "show": lambda: cmd_hide(rest, False)}
+    if cmd not in commands:
+        die(f"unknown command {cmd}")
+    commands[cmd]()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+"""Save, list, apply and remove window layouts across all screens.
+
+Usage:
+  omext-layout list                      JSON list of layouts (for the bar widget)
+  omext-layout current                   id of the current layout, if any
+  omext-layout save <name> [--icon G] [--id ID]
+                                       capture the visible workspaces on every
+                                       screen; an existing id/name is updated
+  omext-layout apply <id>                arrange windows, starting missing apps
+  omext-layout reset                     re-apply the current layout
+  omext-layout remove <id>
+  omext-layout icon <id> <glyph>         change a layout's bar icon
+  omext-layout key <id> [<keys>]         set or clear a layout's shortcut, e.g. "SUPER + ALT + R"
+  omext-layout binds                     key<TAB>id<TAB>name lines (read by hypr/layouts.lua)
+
+Layouts are JSON files in ~/.config/omext/layouts/ (they name this machine's
+monitors), overridable with OMEXT_LAYOUTS_DIR. Window rectangles are
+stored as fractions of their monitor, with each workspace's Omarchy layout mode
+("mode": floating, dwindle or scrolling), the screen's
+zone set ("zones") and, for a floating window that fills one or more of its
+zones, their numbers ("zones" on the window). Apply gives the workspace that
+mode and the screen that set again (layouts saved without a mode get the
+default one, see omarchy-hyprland-workspace-layout-default), puts away the
+windows that aren't the layout's (on a floating workspace: made to fit their
+screen, then minimized; on a tiled one: onto a spare workspace) and puts the
+windows back: floating ones in their zones while the screen has that set,
+else where they were, with room for the titlebar Omarchy gives floating
+workspaces; tiled as a dwindle split tree, the way the hand-written
+work-layout script did.
+"""
+
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# The settings files, read and written omext core's way (as every omext tool does).
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy/plugins/omext.core"))
+try:
+    import omext_settings as settings
+except ImportError:
+    sys.exit("omext-layout: needs omext core (https://github.com/omarchy-extended/core)")
+
+DOCK_TOOL = Path.home() / ".local/bin/omext-dock"  # there with omext docks (optional)
+DOCKS_FILE = Path(os.environ.get("OMEXT_DOCKS_FILE")
+                  or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omext" / "docks.json")
+ZONE_TOOL = Path(__file__).resolve().parent / "omext-zone"  # the zones, beside this
+LAYOUTS = Path(os.environ.get("OMEXT_LAYOUTS_DIR") or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omext" / "layouts")
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omext" / "layouts"
+CURRENT = STATE / "current"
+HYPR_LAYOUT_STATE = Path.home() / ".local/state/omarchy/workspace-layouts"
+MONITOR_BLOCKS = Path.home() / ".local/state/omarchy/monitor-workspaces"
+SLOTS = 10  # workspaces per monitor (Omarchy's monitor-workspaces.lua)
+
+DEFAULT_ICON = "\U000f056e"  # nf-md-view_dashboard
+TERMINALS = {"foot", "Alacritty", "kitty", "com.mitchellh.ghostty"}
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "nu"}
+DESKTOP_DIRS = [
+    Path.home() / ".local/share/applications",
+    Path.home() / ".local/share/flatpak/exports/share/applications",
+    Path("/var/lib/flatpak/exports/share/applications"),
+    Path("/usr/share/applications"),
+]
+PARK = "special:omext-layout"
+TOL = 0.02
+
+
+def die(msg):
+    print(f"omext-layout: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def notify(msg):
+    subprocess.run(["omarchy-notification-send", "-g", DEFAULT_ICON, "Layouts", msg],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- Hyprland ---------------------------------------------------------------
+
+def hypr(what):
+    return json.loads(subprocess.run(["hyprctl", what, "-j"], capture_output=True, text=True, check=True).stdout)
+
+
+def dispatch(expr):
+    if os.environ.get("OMEXT_LAYOUT_TRACE"):
+        print(f"{time.time():.3f} {expr}", file=sys.stderr)
+    subprocess.run(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def q(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def wait_until(check, timeout=2.0, step=0.05):
+    end = time.time() + timeout
+    while time.time() < end:
+        if check():
+            return True
+        time.sleep(step)
+    return check()
+
+
+def logical_size(m):
+    w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+    return (h, w) if m["transform"] % 2 else (w, h)
+
+
+def active_on(monitor_name):
+    for m in hypr("monitors"):
+        if m["name"] == monitor_name:
+            return m["activeWorkspace"]["name"], m["focused"]
+    return None, False
+
+
+# --- window identity --------------------------------------------------------
+
+_desktop_cache = None
+
+
+def desktop_entries():
+    global _desktop_cache
+    if _desktop_cache is None:
+        _desktop_cache = []
+        seen = set()
+        for d in DESKTOP_DIRS:
+            for f in sorted(d.glob("*.desktop")) if d.is_dir() else []:
+                if f.name in seen:
+                    continue
+                seen.add(f.name)
+                entry, section = {}, None
+                try:
+                    for line in f.read_text(errors="replace").splitlines():
+                        if line.startswith("["):
+                            section = line.strip()
+                        elif section == "[Desktop Entry]" and "=" in line:
+                            k, v = line.split("=", 1)
+                            entry.setdefault(k.strip(), v.strip())
+                except OSError:
+                    continue
+                if entry.get("Hidden") == "true":
+                    continue
+                entry["id"] = f.name
+                _desktop_cache.append(entry)
+    return _desktop_cache
+
+
+def desktop_for(cls):
+    low = cls.lower()
+    for e in desktop_entries():
+        if e["id"][:-8].lower() == low:
+            return e
+    for e in desktop_entries():
+        if e.get("StartupWMClass", "").lower() == low:
+            return e
+    return None
+
+
+def children(pid):
+    try:
+        return [int(p) for p in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+    except OSError:
+        return []
+
+
+def comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def cmdline(pid):
+    try:
+        return [a for a in Path(f"/proc/{pid}/cmdline").read_text().split("\0") if a]
+    except OSError:
+        return []
+
+
+def cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return str(Path.home())
+
+
+def is_terminal(cls):
+    return cls in TERMINALS or cls.startswith("org.omarchy.")
+
+
+def terminal_job(pid):
+    """First non-shell process under a terminal: (pid, comm), or (shell pid, None)."""
+    queue, shell = list(children(pid)), None
+    while queue:
+        p = queue.pop(0)
+        name = comm(p)
+        if name in SHELLS:
+            shell = shell or p
+            queue.extend(children(p))
+        elif name:
+            return p, name
+    return shell or pid, None
+
+
+def describe(client):
+    """What a layout stores about a window: how to find it and how to start it."""
+    cls = client["class"] or client["initialClass"]
+    w = {"class": cls}
+    if is_terminal(cls):
+        pid, job = terminal_job(client["pid"])
+        launch = ["xdg-terminal-exec", f"--dir={cwd(pid)}"]
+        if cls.startswith("org.omarchy."):
+            launch.append(f"--app-id={cls}")
+        if job:
+            w["proc"] = job
+            launch += ["-e"] + cmdline(pid)
+            w["label"] = job
+        else:
+            w["label"] = "Terminal"
+        w["launch"] = launch
+        return w
+    entry = desktop_for(cls)
+    if entry:
+        w["launch"] = ["uwsm-app", "--", entry["id"]]
+        w["label"] = entry.get("Name", cls)
+    else:
+        w["launch"] = cmdline(client["pid"])
+        w["label"] = cls
+    return w
+
+
+def client_proc(client):
+    if not is_terminal(client["class"]):
+        return None
+    return terminal_job(client["pid"])[1]
+
+
+# --- storage ----------------------------------------------------------------
+
+def slug(name):
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s or "layout"
+
+
+def path_of(layout_id):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", layout_id):
+        die(f"invalid layout id '{layout_id}'")
+    return LAYOUTS / f"{layout_id}.json"
+
+
+def load(layout_id):
+    p = path_of(layout_id)
+    if not p.exists():
+        die(f"no layout '{layout_id}'")
+    return json.loads(p.read_text())
+
+
+def store(layout_id, layout):
+    settings.write(path_of(layout_id), layout)
+
+
+def current_id():
+    try:
+        i = CURRENT.read_text().strip()
+        return i if path_of(i).exists() else ""
+    except OSError:
+        return ""
+
+
+def set_current(layout_id):
+    STATE.mkdir(parents=True, exist_ok=True)
+    CURRENT.write_text(layout_id + "\n")
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_list():
+    monitors = {m["description"] for m in hypr("monitors")} | {m["name"] for m in hypr("monitors")}
+    out, cur = [], current_id()
+    for p in sorted(LAYOUTS.glob("*.json")) if LAYOUTS.is_dir() else []:
+        try:
+            l = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        screens = []
+        for ws in l.get("workspaces", []):
+            mon = ws.get("monitor", {})
+            screens.append({
+                "workspace": ws["workspace"],
+                "monitor": mon.get("description") or mon.get("name", ""),
+                "x": mon.get("x", 0), "y": mon.get("y", 0),
+                "width": mon.get("width", 16), "height": mon.get("height", 9),
+                "connected": mon.get("description") in monitors or mon.get("name") in monitors,
+                # A maximized or fullscreen window shows filling its screen (its
+                # rect is where it goes back to when un-maximized).
+                "windows": [{"label": w.get("label", w["class"]),
+                             "rect": [0, 0, 1, 1] if w.get("fullscreen") else w["rect"],
+                             "floating": w.get("floating", False)}
+                            for w in ws.get("windows", [])],
+            })
+        out.append({"id": p.stem, "name": l.get("name", p.stem), "icon": l.get("icon", DEFAULT_ICON),
+                    "current": p.stem == cur, "screens": screens})
+    out.sort(key=lambda l: l["name"].lower())
+    print(json.dumps(out, ensure_ascii=False))
+
+
+FULLSCREEN_MODES = {1: "maximized", 2: "fullscreen"}
+
+
+def set_fullscreen(addr, mode, action):
+    dispatch(f"hl.dsp.window.fullscreen({{ mode = {q(mode)}, action = {q(action)}, window = {q('address:' + addr)} }})")
+
+
+def zone_screens():
+    """Each screen's zone set and its zones in layout pixels (omext-zone),
+    by screen name; {} without it."""
+    if not ZONE_TOOL.exists():
+        return {}
+    try:
+        out = subprocess.run([str(ZONE_TOOL), "list"], capture_output=True, text=True, timeout=10).stdout
+        return {m["name"]: m for m in json.loads(out).get("monitors", []) if m.get("set")}
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return {}
+
+
+def zone_sets():
+    """Each screen's zone set (omext-zone), by screen name; {} without it."""
+    return {name: m["set"] for name, m in zone_screens().items()}
+
+
+ZONE_SLACK = 24  # px each edge may be off from a zone (a window's minimum size)
+
+
+def zones_of(c, rects):
+    """The zones (1-based) a floating window fills, as omext-zone snap puts it: its
+    frame (titlebar included) matches one zone or the box around several. None
+    for a window placed by hand."""
+    bar = bar_height() if TITLEBAR_TAG in c.get("tags", []) else 0
+    frame = [c["at"][0], c["at"][1] - bar, c["size"][0], c["size"][1] + bar]
+
+    def inside(z):
+        w = min(z[0] + z[2], frame[0] + frame[2]) - max(z[0], frame[0])
+        h = min(z[1] + z[3], frame[1] + frame[3]) - max(z[1], frame[1])
+        return max(0, w) * max(0, h) >= 0.6 * z[2] * z[3]
+    picked = [i for i, z in enumerate(rects) if inside(z)]
+    if not picked:
+        return None
+    x, y = min(rects[i][0] for i in picked), min(rects[i][1] for i in picked)
+    box = [x, y, max(rects[i][0] + rects[i][2] for i in picked) - x, max(rects[i][1] + rects[i][3] for i in picked) - y]
+    edges = zip((box[0], box[1], box[0] + box[2], box[1] + box[3]),
+                (frame[0], frame[1], frame[0] + frame[2], frame[1] + frame[3]))
+    return [i + 1 for i in picked] if all(abs(a - b) <= ZONE_SLACK for a, b in edges) else None
+
+
+def snap(addr, picks, monitor):
+    """Put a window in zones picks of monitor (omext-zone snap); True if it went."""
+    got = subprocess.run([str(ZONE_TOOL), "snap", ",".join(map(str, picks)), "--window", addr, "--monitor", monitor],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return got.returncode == 0
+
+
+def use_zones(name, monitor):
+    """Give a screen the zone set a layout was saved with (if it still exists)."""
+    if name and ZONE_TOOL.exists() and zone_sets().get(monitor) != name:
+        subprocess.run([str(ZONE_TOOL), "use", name, "--monitor", monitor],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def capture():
+    monitors = hypr("monitors")
+    visible = {m["activeWorkspace"]["name"] for m in monitors}
+    # A maximized window hides its tile position: read it un-maximized, then restore.
+    restore = {c["address"]: FULLSCREEN_MODES[c["fullscreen"]] for c in hypr("clients")
+               if c["workspace"]["name"] in visible and c["fullscreen"] in FULLSCREEN_MODES}
+    for addr, mode in restore.items():
+        set_fullscreen(addr, mode, "unset")
+    if restore:
+        time.sleep(0.3)
+    clients = hypr("clients")
+    for addr, mode in restore.items():
+        set_fullscreen(addr, mode, "set")
+    screens = zone_screens()
+    workspaces = []
+    for m in sorted(monitors, key=lambda m: (m["x"], m["y"])):
+        ws = m["activeWorkspace"]["name"]
+        if ws.startswith("special"):
+            continue
+        lw, lh = logical_size(m)
+        windows = []
+        for c in clients:
+            if c["workspace"]["name"] != ws or not c["mapped"] or c["hidden"] or c.get("pinned"):
+                continue  # pinned: on every workspace, e.g. a dock's apps (omext-dock)
+            w = describe(c)
+            w["floating"] = bool(c["floating"])
+            if c["address"] in restore:
+                w["fullscreen"] = restore[c["address"]]
+            w["rect"] = [round((c["at"][0] - m["x"]) / lw, 4), round((c["at"][1] - m["y"]) / lh, 4),
+                         round(c["size"][0] / lw, 4), round(c["size"][1] / lh, 4)]
+            if c["floating"] and m["name"] in screens and c["address"] not in restore:
+                picks = zones_of(c, screens[m["name"]]["zones"])
+                if picks:
+                    w["zones"] = picks  # in the screen's set; the rect is the fallback
+            windows.append(w)
+        windows.sort(key=lambda w: (w["floating"], w["rect"][1], w["rect"][0]))
+        workspaces.append({
+            "workspace": ws,
+            "focused": bool(m["focused"]),
+            "mode": mode_of(ws),
+            "monitor": {"name": m["name"], "description": m["description"],
+                        "x": m["x"], "y": m["y"], "width": round(lw), "height": round(lh)},
+            "windows": windows,
+        })
+        if m["name"] in screens:
+            workspaces[-1]["zones"] = screens[m["name"]]["set"]  # the screen's zone set
+    return workspaces
+
+
+def cmd_save(args):
+    if not args:
+        die("save needs a name")
+    name, icon, layout_id = args[0], None, None
+    rest = args[1:]
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--icon" and rest:
+            icon = rest.pop(0)
+        elif flag == "--id" and rest:
+            layout_id = rest.pop(0)
+        else:
+            die(f"unknown option {flag}")
+    layout_id = layout_id or slug(name)
+    p = path_of(layout_id)
+    old = json.loads(p.read_text()) if p.exists() else {}
+    layout = {
+        "name": name or old.get("name", layout_id),
+        "icon": icon or old.get("icon", DEFAULT_ICON),
+        "workspaces": capture(),
+    }
+    if old.get("key"):
+        layout["key"] = old["key"]
+    store(layout_id, layout)
+    set_current(layout_id)
+    print(layout_id)
+
+
+def cmd_remove(args):
+    if not args:
+        die("remove needs an id")
+    path_of(args[0]).unlink(missing_ok=True)
+    if current_id() == "" and CURRENT.exists():
+        CURRENT.unlink()
+
+
+def cmd_icon(args):
+    if len(args) < 2:
+        die("icon needs an id and a glyph")
+    layout = load(args[0])
+    layout["icon"] = args[1]
+    store(args[0], layout)
+
+
+def cmd_key(args):
+    if not args:
+        die("key needs an id")
+    layout = load(args[0])
+    if len(args) > 1 and args[1].strip():
+        layout["key"] = args[1].strip()
+    else:
+        layout.pop("key", None)
+    store(args[0], layout)
+    subprocess.run(["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_binds():
+    for p in sorted(LAYOUTS.glob("*.json")) if LAYOUTS.is_dir() else []:
+        try:
+            l = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if l.get("key"):
+            print(f"{l['key']}\t{p.stem}\t{l.get('name', p.stem)}")
+
+
+# --- apply ------------------------------------------------------------------
+
+def find_monitor(spec, monitors):
+    for key in ("description", "name"):
+        for m in monitors:
+            if spec.get(key) and m[key] == spec[key]:
+                return m
+    return None
+
+
+def matches(client, want):
+    if client["class"] != want["class"] and client["initialClass"] != want["class"]:
+        return False
+    if is_terminal(want["class"]):
+        return client_proc(client) == want.get("proc")
+    return True
+
+
+def pick(clients, want, target_ws, claimed):
+    """Best running window for a layout entry: one already in place first."""
+    # A window in a dock (the docks addon) is the dock's: a layout leaves it there.
+    candidates = [c for c in clients if c["address"] not in claimed and c["mapped"] and matches(c, want)
+                  and "omext-docked" not in c.get("tags", [])]
+    candidates.sort(key=lambda c: (c["workspace"]["name"] != target_ws, c["workspace"]["name"].startswith("special")))
+    return candidates[0]["address"] if candidates else None
+
+
+def runnable(cmd):
+    """uwsm-app only takes desktop ids it calls valid: none with a space (as
+    "Microsoft Teams.desktop"). Those run their Exec line instead."""
+    if len(cmd) == 3 and cmd[:2] == ["uwsm-app", "--"] and cmd[2].endswith(".desktop") and re.search(r"\s", cmd[2]):
+        entry = next((e for e in desktop_entries() if e["id"] == cmd[2]), None)
+        if entry and entry.get("Exec"):
+            argv = [a for a in shlex.split(entry["Exec"]) if not re.fullmatch(r"%[a-zA-Z]", a)]
+            return ["uwsm-app", "--"] + argv
+    return cmd
+
+
+def dock_apps():
+    """The docks addon's apps: dock id, app id, window classes and the docked
+    window's address ("" when not running); [] without the addon."""
+    if not DOCK_TOOL.exists():
+        return []
+    try:
+        listing = json.loads(subprocess.run([str(DOCK_TOOL), "list"], capture_output=True, text=True, timeout=10).stdout)
+        config = settings.read(DOCKS_FILE, {})
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return []
+    address = {(d["id"], a["id"]): a.get("address") or "" for d in listing.get("docks", []) for a in d.get("apps", [])}
+    out = []
+    for d in config.get("docks", []):
+        for a in d.get("apps", []):
+            cls = a.get("class") or []
+            out.append({"dock": d["id"], "app": a["id"], "classes": [cls] if isinstance(cls, str) else cls,
+                        "address": address.get((d["id"], a["id"]), "")})
+    return out
+
+
+def dock_tool(*args):
+    subprocess.run([str(DOCK_TOOL), *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def take_from_docks(plan):
+    """A layout's windows that are a dock's apps (the docks addon): one hidden in
+    its dock is let go of (omext-dock release: a favorite stays in the dock, as a
+    shortcut to opening it there), for the layout to place; one the dock shows
+    now stays there, and the layout leaves it out. One not running is started
+    as any other: the dock takes only what it starts itself."""
+    apps, clients = dock_apps(), {c["address"]: c for c in hypr("clients")}
+    released = False
+    for ws, _ in plan:
+        keep = []
+        for w in ws["windows"]:
+            a = next((a for a in apps if w["class"] in a["classes"]), None)
+            c = clients.get(a["address"]) if a else None
+            if c and not c["workspace"]["name"].startswith("special"):
+                continue  # shown in its dock
+            if c:
+                dock_tool("release", a["dock"], a["app"])
+                released = True
+            keep.append(w)
+        ws["windows"] = keep
+    if released:
+        time.sleep(0.3)
+
+
+def dock_back(addr):
+    """A dock's app that is out of its dock goes back in (omext-dock back); True
+    if it went. False without the docks addon, or for any other window."""
+    if not DOCK_TOOL.exists():
+        return False
+    try:
+        return subprocess.run([str(DOCK_TOOL), "back", "--window", addr], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def launch(cmd):
+    if not cmd:
+        return
+    cmd = runnable(cmd if cmd[0] == "uwsm-app" else ["uwsm-app", "--"] + cmd)
+    subprocess.Popen(["setsid", "-f"] + cmd,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
+
+def tree(items):
+    """Split tiled windows into a guillotine tree: ('leaf', i) or (cut, frac, a, b)."""
+    if len(items) == 1:
+        return ("leaf", items[0][0])
+    for axis, cut in ((0, "v"), (1, "h")):  # side by side first, then stacked
+        lo = min(r[axis] for _, r in items)
+        hi = max(r[axis] + r[axis + 2] for _, r in items)
+        for _, r in sorted(items, key=lambda it: it[1][axis]):
+            edge = r[axis] + r[axis + 2]
+            a = [it for it in items if it[1][axis] + it[1][axis + 2] <= edge + TOL]
+            b = [it for it in items if it[1][axis] >= edge - TOL]
+            if a and b and len(a) + len(b) == len(items):
+                return (cut, (edge - lo) / (hi - lo), tree(a), tree(b))
+    # Not a clean split tree (e.g. saved from a scrolling workspace): halve it.
+    items = sorted(items, key=lambda it: (it[1][0], it[1][1]))
+    half = len(items) // 2
+    return ("v", half / len(items), tree(items[:half]), tree(items[half:]))
+
+
+def first_leaf(node):
+    return node[1] if node[0] == "leaf" else first_leaf(node[2])
+
+
+def realize(node, addrs, ws):
+    if node[0] == "leaf":
+        return
+    cut, frac, a, b = node
+    rep, new = addrs[first_leaf(a)], addrs[first_leaf(b)]
+    dispatch(f"hl.dsp.focus({{ window = {q('address:' + rep)} }})")
+    dispatch(f"hl.dsp.layout('preselect {'r' if cut == 'v' else 'd'}')")
+    dispatch(f"hl.dsp.window.move({{ workspace = {q(ws)}, follow = false, window = {q('address:' + new)} }})")
+    time.sleep(0.15)
+    dispatch(f"hl.dsp.focus({{ window = {q('address:' + rep)} }})")
+    dispatch(f"hl.dsp.layout('splitratio {max(0.1, min(1.9, 2 * frac)):.3f} exact')")
+    realize(a, addrs, ws)
+    realize(b, addrs, ws)
+
+
+def show_on(ws, monitor):
+    """Make workspace ws the visible one on monitor, verifying each step. Never
+    by focusing the monitor first: focus could go straight back to the other
+    screen (the window there taking it), and then ws opened over there."""
+    if active_on(monitor)[0] == ws:
+        return True
+
+    def home():
+        return next((w["monitor"] for w in hypr("workspaces") if w["name"] == ws), None)
+    if home() is None:
+        dispatch(f"hl.dsp.focus({{ workspace = {q(ws)} }})")  # makes it, maybe elsewhere
+        if not wait_until(lambda: home() is not None):
+            return False
+    if home() != monitor:
+        dispatch(f"hl.dsp.workspace.move({{ workspace = {q(ws)}, monitor = {q(monitor)} }})")
+        if not wait_until(lambda: home() == monitor):
+            return False
+    dispatch(f"hl.dsp.focus({{ workspace = {q(ws)} }})")
+    return wait_until(lambda: active_on(monitor)[0] == ws)
+
+
+def refresh(ws, monitor):
+    """Hyprland can go on drawing windows moved in from another screen or a
+    hidden workspace where they were (or part way there), although it reports
+    the new place, until the screen shows another workspace. So it shows an
+    empty one of its own for a moment (Omarchy's per-screen switch, which
+    keeps it on this screen), then ws again."""
+    if not ws.isdigit():
+        return
+    base = (int(ws) - 1) // SLOTS * SLOTS
+    used = {w["name"] for w in hypr("workspaces")}
+    empty = next((n for n in range(base + 1, base + SLOTS + 1) if str(n) not in used), None)
+    if empty is None:
+        return
+    dispatch(f"o.workspaces.focus({empty - base}, {q(monitor)})")
+    if wait_until(lambda: active_on(monitor)[0] == str(empty), timeout=1.0):
+        time.sleep(0.05)
+    dispatch(f"o.workspaces.focus({int(ws) - base}, {q(monitor)})")
+    wait_until(lambda: active_on(monitor)[0] == ws, timeout=1.0)
+
+
+def workspace_on(name, m):
+    """The workspace `name` (as saved) in monitor m's own block: Omarchy gives each
+    monitor workspaces 1-10 of its own, numbered globally in blocks of ten that
+    belong to the physical monitor (laptop 1-10, the next 11-20...). Saved
+    numbers keep their place in the block; ones from before blocks were the
+    first ten. Unchanged without a block for m."""
+    if not name.isdigit() or int(name) < 1:
+        return name
+    identity = " ".join(v for v in (m.get("make"), m.get("model"), m.get("serial")) if v)
+    try:
+        for line in MONITOR_BLOCKS.read_text().splitlines():
+            block, _, who = line.split("\t", 2)
+            if who in (identity, m.get("description")):
+                return str(int(block) * SLOTS + (int(name) - 1) % SLOTS + 1)
+    except (OSError, ValueError):
+        pass
+    return name
+
+
+MODES = ("floating", "dwindle", "scrolling")
+TITLEBAR_TAG = "omarchy-floating-workspace"  # Omarchy's hyprbars draw on windows with it
+
+
+def default_mode():
+    out = subprocess.run(["omarchy-hyprland-workspace-layout-default"], capture_output=True, text=True).stdout.strip()
+    return out if out in MODES else "dwindle"
+
+
+def mode_of(ws):
+    """Workspace ws's Omarchy layout mode: its own file, else the default."""
+    try:
+        got = re.search(r'mode\s*=\s*"(\w+)"', (HYPR_LAYOUT_STATE / f"{ws}.lua").read_text())
+        if got and got.group(1) in MODES:
+            return got.group(1)
+    except OSError:
+        pass
+    return default_mode()
+
+
+def bar_height():
+    try:
+        got = json.loads(subprocess.check_output(["hyprctl", "getoption", "plugin:hyprbars:bar_height", "-j"],
+                                                 stderr=subprocess.DEVNULL))
+        return int(got.get("int") or got.get("custom") or 30)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError, TypeError):
+        return 30
+
+
+def use_mode(ws, name):
+    """Give workspace ws Omarchy's layout mode `name`, the way its layout toggle
+    (Super + D) does: a workspace on the default mode has no file of its own."""
+    if not ws.isdigit():
+        return
+    mode = f'o.workspace_mode({{ workspace = "{ws}", mode = "{name}" }})'
+    state = HYPR_LAYOUT_STATE / f"{ws}.lua"
+    want = None if name == default_mode() else mode + "\n"
+    have = state.read_text() if state.exists() else None
+    # Hyprland reloads its config when this file changes, which resets no_warps.
+    if have != want:
+        if want:
+            HYPR_LAYOUT_STATE.mkdir(parents=True, exist_ok=True)
+            state.write_text(want)
+        else:
+            state.unlink()
+        time.sleep(0.3)
+        hold_pointer()
+    subprocess.run(["hyprctl", "eval", mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["omarchy-shell", "-q", "omarchy.workspaces", "refresh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+FIT_SLACK = 8  # px a window may be over a screen's room and still count as fitting
+
+
+def usable(m, bar=0):
+    """A screen's room for a window, in layout pixels (x, y, w, h): without what's
+    reserved at its edges (the bar, a dock's strip) and, on a floating
+    workspace, the titlebar's height above the window."""
+    lw, lh = logical_size(m)
+    left, top, right, bottom = (list(m.get("reserved") or []) + [0, 0, 0, 0])[:4]
+    return m["x"] + left, m["y"] + top + bar, max(100, lw - left - right), max(100, lh - top - bottom - bar)
+
+
+def fit(c, m, bar=0):
+    """A floating window made to fit screen m: one larger than the screen has room
+    for fills that room (as maximized would), another that hangs off an edge is
+    moved back onto the screen. True if it was changed."""
+    ax, ay, aw, ah = usable(m, bar)
+    (x, y), (w, h) = c["at"], c["size"]
+    a = q("address:" + c["address"])
+    if w > aw + FIT_SLACK or h > ah + FIT_SLACK:
+        nx, ny, nw, nh = ax, ay, aw, ah
+    else:  # (a pixel or two over, from rounding: left as it is)
+        nw, nh = w, h
+        nx = x if w >= aw else min(max(x, ax), ax + aw - w)
+        ny = y if h >= ah else min(max(y, ay), ay + ah - h)
+    if (nx, ny, nw, nh) == (x, y, w, h):
+        return False
+    if (nw, nh) != (w, h):
+        dispatch(f"hl.dsp.window.resize({{ x = {nw}, y = {nh}, relative = false, window = {a} }})")
+    dispatch(f"hl.dsp.window.move({{ x = {nx}, y = {ny}, relative = false, window = {a} }})")
+    return True
+
+
+def minimize(c):
+    """Omarchy's minimize, whatever mode its workspace has right now (the layout
+    gives it the floating one next): onto the minimized workspace, tagged with
+    the workspace it came from, for the taskbar or the dock to bring it back."""
+    a = q("address:" + c["address"])
+    ws = c["workspace"]["id"]
+    for tag in c.get("tags") or []:
+        tag = tag.rstrip("*")
+        if re.fullmatch(r"omarchy-minimized-from-\d+", tag) and tag != f"omarchy-minimized-from-{ws}":
+            dispatch(f"hl.dsp.window.tag({{ tag = {q('-' + tag)}, window = {a} }})")
+    dispatch(f"hl.dsp.window.tag({{ tag = {q('+omarchy-minimized-from-' + str(ws))}, window = {a} }})")
+    dispatch(f"hl.dsp.window.move({{ workspace = 'special:minimized', follow = false, window = {a} }})")
+
+
+def hold_pointer():
+    subprocess.run(["hyprctl", "eval", "hl.config({ cursor = { no_warps = true } })"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+LATE = 30  # seconds to wait for apps the layout started
+
+
+def cmd_apply(args):
+    """Arrange the windows that are there, start the missing ones, and once they
+    have all come (or LATE is up) arrange again to fit them in."""
+    missing, claimed = apply_pass(args, first=True)
+    if not missing:
+        return
+    end = time.time() + LATE
+    while time.time() < end:
+        time.sleep(0.5)
+        clients, taken = hypr("clients"), set(claimed)
+        found = 0
+        for name, w in missing:
+            addr = pick(clients, w, name, taken)
+            if addr:
+                taken.add(addr)
+                found += 1
+        if found == len(missing):
+            break
+    apply_pass(args, first=False)
+
+
+def apply_pass(args, first):
+    # Every focus change would warp the pointer to that window; keep it where it was.
+    out = subprocess.run(["hyprctl", "getoption", "cursor:no_warps"], capture_output=True, text=True).stdout
+    no_warps = "true" if re.search(r"(bool|int): (true|1)\b", out) else "false"
+    # No animations while windows are moved around: across long moves some were
+    # left drawn where they started (and without titlebars) until the screen
+    # switched workspace.
+    out = subprocess.run(["hyprctl", "getoption", "animations:enabled"], capture_output=True, text=True).stdout
+    animations = "false" if re.search(r"(bool|int): (false|0)\b", out) else "true"
+    subprocess.run(["hyprctl", "eval", "hl.config({ animations = { enabled = false } })"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pos = hypr("cursorpos")
+    hold_pointer()
+    done = False
+    try:
+        missing, claimed = arrange(args, launch_missing=first)
+        dispatch(f"hl.dsp.cursor.move({{ x = {pos['x']}, y = {pos['y']} }})")
+        done = True
+        return missing, claimed
+    finally:
+        subprocess.run(["hyprctl", "eval", f"hl.config({{ cursor = {{ no_warps = {no_warps} }} }})"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["hyprctl", "eval", f"hl.config({{ animations = {{ enabled = {animations} }} }})"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not done:
+            dispatch(f"hl.dsp.cursor.move({{ x = {pos['x']}, y = {pos['y']} }})")
+
+
+def arrange(args, launch_missing=True):
+    first_pass = launch_missing
+    """Arrange the layout's windows that are open; returns the (workspace,
+    window) entries not found that were started (launch_missing), and the
+    windows it used."""
+    if not args:
+        die("apply needs an id")
+    layout_id = args[0]
+    layout = load(layout_id)
+    monitors = hypr("monitors")
+    plan = []
+    for ws in layout["workspaces"]:
+        m = find_monitor(ws["monitor"], monitors)
+        if m:
+            ws["workspace"] = workspace_on(ws["workspace"], m)
+            plan.append((ws, m))
+    if not plan:
+        die("none of this layout's screens are connected")
+    targets = {ws["workspace"] for ws, _ in plan}
+
+    # 1. Find or start every window, a dock's apps out of their docks.
+    take_from_docks(plan)
+    clients = hypr("clients")
+    claimed, slots, missing = set(), {}, []
+    for wi, (ws, _) in enumerate(plan):
+        for i, w in enumerate(ws["windows"]):
+            addr = pick(clients, w, ws["workspace"], claimed)
+            if addr:
+                claimed.add(addr)
+                slots[(wi, i)] = addr
+            else:
+                missing.append((wi, i, w))
+                if launch_missing:
+                    launch(w.get("launch"))
+    started = [m for m in missing if launch_missing and m[2].get("launch")]
+    lost = [m for m in missing if m not in started]
+    if started:
+        notify(f"Starting {', '.join(w.get('label', w['class']) for _, _, w in started)}: fitted in as they open")
+    if lost:
+        notify("Couldn't start: " + ", ".join(w.get("label", w["class"]) for _, _, w in lost))
+
+    # 2. Park the windows of tiled workspaces (their split tree is rebuilt from
+    # nothing), move everything else off the layout's workspaces. Windows of a
+    # floating workspace are not parked: one already there is only put in its
+    # place, another moves there straight. Each long move (a hidden workspace,
+    # another screen) risks Hyprland drawing the window where it was.
+    # Apps can restore their own maximized/fullscreen state; that hides the tiling.
+    floating_ws = {ws["workspace"] for ws, _ in plan if (ws.get("mode") or default_mode()) == "floating"}
+    for (wi, i), addr in slots.items():
+        for mode in FULLSCREEN_MODES.values():
+            set_fullscreen(addr, mode, "unset")
+        if plan[wi][0]["workspace"] not in floating_ws:
+            dispatch(f"hl.dsp.window.move({{ workspace = {q(PARK)}, follow = false, window = {q('address:' + addr)} }})")
+    clients = hypr("clients")
+    used = {c["workspace"]["name"] for c in clients}
+    # A free workspace in the same monitor's block, so they stay on that screen.
+    spares = {}
+    for name in targets:
+        if name.isdigit():
+            base = (int(name) - 1) // SLOTS * SLOTS
+            spares[name] = next((str(n) for n in range(base + 1, base + SLOTS + 1)
+                                 if str(n) not in targets and str(n) not in used), None)
+    # The windows that aren't the layout's. A dock's app (out of its dock for
+    # another layout, or let go of) goes back into its dock: a layout saved with
+    # it docked has it docked again. The rest, on a floating workspace: made to fit
+    # their screen (one sized for a larger screen fills this one), then minimized,
+    # out of the way and one click from back. On a tiled one, where nothing
+    # brings a minimized window back: onto the spare workspace, as before.
+    # Those minimized already are made to fit too, for when they come back.
+    screen_of = {ws["workspace"]: m for ws, m in plan}
+    by_id = {m["id"]: m for m in monitors}
+    bar = bar_height()
+    put_away = docked = 0
+    for c in clients:
+        name = c["workspace"]["name"]
+        tags = [t.rstrip("*") for t in c.get("tags") or []]
+        if c["address"] in claimed or c.get("pinned") or "omext-docked" in tags or not c.get("mapped", True):
+            continue
+        a = q("address:" + c["address"])
+        if name in targets and dock_back(c["address"]):
+            docked += 1  # a dock's app that isn't in the layout: back in its dock
+        elif name in floating_ws:
+            for mode in FULLSCREEN_MODES.values():
+                set_fullscreen(c["address"], mode, "unset")
+            if not c.get("floating"):
+                dispatch(f"hl.dsp.window.float({{ action = 'on', window = {a} }})")
+                c = next((n for n in hypr("clients") if n["address"] == c["address"]), c)
+            fit(c, screen_of[name], bar)
+            minimize(c)
+            put_away += 1
+        elif name == "special:minimized" and c.get("floating") and by_id.get(c.get("monitor")):
+            fit(c, by_id[c["monitor"]], bar)
+        elif spares.get(name):
+            dispatch(f"hl.dsp.window.move({{ workspace = {q(spares[name])}, follow = false, window = {a} }})")
+    if put_away and first_pass:
+        notify(f"Minimized {put_away} window{'' if put_away == 1 else 's'} that {'is' if put_away == 1 else 'are'}n't in this layout")
+
+    # 3. Rebuild each workspace on its monitor.
+    for wi, (ws, m) in enumerate(plan):
+        name = ws["workspace"]
+        if not show_on(name, m["name"]):
+            notify(f"Couldn't show workspace {name} on {m['name']}")
+            continue
+        # Older layouts have no mode: they were tiled, and get the default now.
+        saved_mode = ws.get("mode", "dwindle")
+        mode = ws.get("mode") or default_mode()
+        use_mode(name, mode)
+        if first_pass:
+            use_zones(ws.get("zones"), m["name"])
+        lw, lh = logical_size(m)
+        floating = mode == "floating"
+        tiled = [(i, w["rect"]) for i, w in enumerate(ws["windows"])
+                 if not floating and not w.get("floating") and (wi, i) in slots]
+        addrs = {i: slots[(wi, i)] for i, _ in tiled}
+        for addr in addrs.values():
+            dispatch(f"hl.dsp.window.float({{ action = 'off', window = {q('address:' + addr)} }})")
+        if tiled and mode == "scrolling":
+            # Columns left to right; scrolling has no split tree to rebuild.
+            for i, _ in sorted(tiled, key=lambda it: (it[1][0], it[1][1])):
+                dispatch(f"hl.dsp.window.move({{ workspace = {q(name)}, follow = false, window = {q('address:' + addrs[i])} }})")
+                time.sleep(0.1)
+        elif tiled:
+            root = tree(tiled)
+            dispatch(f"hl.dsp.window.move({{ workspace = {q(name)}, follow = false, window = {q('address:' + addrs[first_leaf(root)])} }})")
+            time.sleep(0.15)
+            realize(root, addrs, name)
+        # A tiled window saved on a tiled workspace had no titlebar: on a floating
+        # one it goes just below where its top was, so the bar stays on screen.
+        bar = bar_height() if floating and saved_mode != "floating" else 0
+        # Windows saved in zones go back in them while the screen has that set.
+        zoned = ws.get("zones") and zone_sets().get(m["name"]) == ws["zones"]
+        where = {c["address"]: c["workspace"]["name"] for c in hypr("clients")}
+        for i, w in enumerate(ws["windows"]):
+            if (not floating and not w.get("floating")) or (wi, i) not in slots:
+                continue
+            a = q("address:" + slots[(wi, i)])
+            x, y, fw, fh = w["rect"]
+            inset = bar
+            if where.get(slots[(wi, i)]) != name:
+                dispatch(f"hl.dsp.window.move({{ workspace = {q(name)}, follow = false, window = {a} }})")
+            dispatch(f"hl.dsp.window.float({{ action = 'on', window = {a} }})")
+            if zoned and w.get("zones") and snap(slots[(wi, i)], w["zones"], m["name"]):
+                continue
+            dispatch(f"hl.dsp.window.resize({{ x = {round(fw * lw)}, y = {round(fh * lh) - inset}, relative = false, window = {a} }})")
+            dispatch(f"hl.dsp.window.move({{ x = {m['x'] + round(x * lw)}, y = {m['y'] + round(y * lh) + inset}, relative = false, window = {a} }})")
+
+        for i, w in enumerate(ws["windows"]):
+            if w.get("fullscreen") in FULLSCREEN_MODES.values() and (wi, i) in slots:
+                set_fullscreen(slots[(wi, i)], w["fullscreen"], "set")
+
+    # A layout's window that came out larger than its screen has room for (an
+    # app's own minimum size, a layout saved on a larger screen): fills the screen.
+    now = {c["address"]: c for c in hypr("clients")}
+    for (wi, i), addr in slots.items():
+        c = now.get(addr)
+        if c and c.get("floating") and not c.get("fullscreen") and c["workspace"]["name"] in floating_ws:
+            ax, ay, aw, ah = usable(plan[wi][1], bar)
+            if c["size"][0] > aw + FIT_SLACK or c["size"][1] > ah + FIT_SLACK:
+                fit(c, plan[wi][1], bar)
+
+    # 4. Have each screen draw its windows where they are now.
+    for ws, m in plan:
+        refresh(ws["workspace"], m["name"])
+
+    # 5. End on the screen that had focus when the layout was saved.
+    last = next(((ws, m) for ws, m in plan if ws.get("focused")), plan[0])
+    show_on(last[0]["workspace"], last[1]["name"])
+    set_current(layout_id)
+    return [(plan[wi][0]["workspace"], w) for wi, _, w in started], claimed
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "current":
+        print(current_id())
+    elif cmd == "save":
+        cmd_save(rest)
+    elif cmd in ("apply", "reset"):
+        if cmd == "reset":
+            rest = [current_id()]
+            if not rest[0]:
+                die("no current layout")
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "apply.lock", "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                die("a layout is already being applied")
+            cmd_apply(rest)
+    elif cmd == "remove":
+        cmd_remove(rest)
+    elif cmd == "icon":
+        cmd_icon(rest)
+    elif cmd == "key":
+        cmd_key(rest)
+    elif cmd == "binds":
+        cmd_binds()
+    else:
+        die(f"unknown command {cmd}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "omext.arrange",
+  "name": "Arrange",
+  "version": "1.0.0",
+  "author": "omarchy-extended",
+  "license": "MIT",
+  "description": "Arrange windows: saved layouts across all screens (apply, reset, save, update, remove), and each screen's zones (opens the zone picker).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Arrange",
+    "description": "Saved window layouts, and each screen's zone set.",
+    "category": "Workspace",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "label": "Arrange",
+      "padding": 16
+    },
+    "schema": [
+      {
+        "key": "label",
+        "type": "string",
+        "label": "Bar label",
+        "defaultValue": "Arrange"
+      },
+      {
+        "key": "padding",
+        "type": "integer",
+        "label": "Left padding (px)",
+        "min": 0,
+        "max": 60,
+        "step": 2,
+        "defaultValue": 16
+      }
+    ]
+  }
+}
