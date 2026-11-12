@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omext.arrange",
   "name": "Arrange",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "omarchy-extended",
   "license": "MIT",
   "description": "Arrange windows: saved layouts across all screens (apply, reset, save, update, remove), and each screen's zones (opens the zone picker).",
