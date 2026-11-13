@@ -13,6 +13,12 @@ Usage:
   omext-layout icon <id> <glyph>         change a layout's bar icon
   omext-layout key <id> [<keys>]         set or clear a layout's shortcut, e.g. "SUPER + ALT + R"
   omext-layout binds                     key<TAB>id<TAB>name lines (read by hypr/layouts.lua)
+  omext-layout auto <id> [on|off|toggle] the layout is its screens' own: applied by itself
+                                       whenever exactly the screens it was saved with
+                                       are connected (one layout per set of screens);
+                                       nothing is started then, the open windows are arranged
+  omext-layout screens [--now]           the screens changed: apply their own layout, if
+                                       there is one (hypr/layouts.lua calls this)
 
 Layouts are JSON files in ~/.config/omext/layouts/ (they name this machine's
 monitors), overridable with OMEXT_LAYOUTS_DIR. Window rectangles are
@@ -305,7 +311,7 @@ def cmd_list():
                             for w in ws.get("windows", [])],
             })
         out.append({"id": p.stem, "name": l.get("name", p.stem), "icon": l.get("icon", DEFAULT_ICON),
-                    "current": p.stem == cur, "screens": screens})
+                    "current": p.stem == cur, "auto": bool(l.get("auto")), "screens": screens})
     out.sort(key=lambda l: l["name"].lower())
     print(json.dumps(out, ensure_ascii=False))
 
@@ -477,6 +483,78 @@ def cmd_key(args):
     subprocess.run(["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# A layout can be its screens' own: with "auto" on, it is applied by itself
+# whenever the screens connected are exactly the ones it was saved with (plug
+# the big screen in, and the windows go back to their places there; unplug it,
+# and the laptop's layout takes over). One layout per set of screens. Applied so,
+# nothing is started: only the windows that are open are arranged.
+def screens_of(layout):
+    return frozenset(ws.get("monitor", {}).get("description") or ws.get("monitor", {}).get("name", "")
+                     for ws in layout.get("workspaces", []))
+
+
+def all_layouts():
+    out = {}
+    for p in sorted(LAYOUTS.glob("*.json")) if LAYOUTS.is_dir() else []:
+        try:
+            out[p.stem] = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    return out
+
+
+def cmd_auto(args):
+    if not args:
+        die("auto needs an id (and on, off or toggle)")
+    layout = load(args[0])
+    want = args[1] if len(args) > 1 else "toggle"
+    on = (not layout.get("auto")) if want == "toggle" else want == "on"
+    if on:
+        mine = screens_of(layout)
+        for other_id, other in all_layouts().items():  # one per set of screens
+            if other_id != args[0] and other.get("auto") and screens_of(other) == mine:
+                other.pop("auto", None)
+                store(other_id, other)
+        layout["auto"] = True
+    else:
+        layout.pop("auto", None)
+    store(args[0], layout)
+    print("on" if on else "off")
+
+
+def cmd_screens(args):
+    """The screens changed (hypr/layouts.lua calls this, and at login): the
+    layout that is these screens' own, if there is one, is applied."""
+    global QUIET
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "screens.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # one at a time: a screen coming fires more than once
+        if "--now" not in args:
+            time.sleep(2)  # the change settles (workspaces move, windows follow)
+        connected = frozenset(m.get("description") or m["name"] for m in hypr("monitors"))  # (as screens_of names them)
+        stamp = STATE / "screens.last"
+        try:
+            last = json.loads(stamp.read_text())
+        except (OSError, ValueError):
+            last = {}
+        if last.get("screens") == sorted(connected) and time.time() - last.get("t", 0) < 5:
+            return  # just done for these
+        match = [i for i, l in all_layouts().items() if l.get("auto") and screens_of(l) == connected]
+        stamp.write_text(json.dumps({"screens": sorted(connected), "t": time.time(), "layout": match[0] if match else ""}))
+        if not match:
+            return
+        with open(STATE / "apply.lock", "w") as busy:
+            try:
+                fcntl.flock(busy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return  # one is being applied by hand
+            QUIET = True
+            missing, _ = apply_pass([match[0]], first=True)
+            if missing:
+                apply_pass([match[0]], first=False)
+        stamp.write_text(json.dumps({"screens": sorted(connected), "t": time.time(), "layout": match[0]}))
+
+
 def cmd_binds():
     for p in sorted(LAYOUTS.glob("*.json")) if LAYOUTS.is_dir() else []:
         try:
@@ -585,8 +663,11 @@ def dock_back(addr):
         return False
 
 
+QUIET = False  # applied by itself (the screens changed): nothing is started
+
+
 def launch(cmd):
-    if not cmd:
+    if not cmd or QUIET:
         return
     cmd = runnable(cmd if cmd[0] == "uwsm-app" else ["uwsm-app", "--"] + cmd)
     subprocess.Popen(["setsid", "-f"] + cmd,
@@ -1046,6 +1127,10 @@ def main():
         cmd_icon(rest)
     elif cmd == "key":
         cmd_key(rest)
+    elif cmd == "auto":
+        cmd_auto(rest)
+    elif cmd == "screens":
+        cmd_screens(rest)
     elif cmd == "binds":
         cmd_binds()
     else:

@@ -105,6 +105,8 @@ Panel {
 
   function applyLayout(layout) { run(["apply", layout.id], true) }
   function reset() { if (currentId !== "") run(["reset"], false) }
+  // A layout as its screens' own: applied by itself when exactly those are connected.
+  function toggleAuto(layout) { run(["auto", layout.id, "toggle"], false) }
 
   function askConfirm(action, layout) {
     confirmAction = action
@@ -287,6 +289,7 @@ Panel {
         else if (t === "n" || t === "N") root.startSave()
         else if ((t === "u" || t === "U") && root.layouts.length > 0) root.askConfirm("update", root.layouts[root.cursor])
         else if (t === "r" || t === "R") root.reset()
+        else if ((t === "a" || t === "A") && root.layouts.length > 0) root.toggleAuto(root.layouts[root.cursor])
       }
 
       Flickable {
@@ -516,7 +519,7 @@ Panel {
           Text {
             visible: root.mode === "list" && root.layouts.length > 0
             width: parent.width
-            text: "1–9 or Enter apply · u update · x remove · r reset · Esc close"
+            text: "1–9 or Enter apply · u update · a by itself · x remove · r reset · Esc close"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -603,7 +606,7 @@ Panel {
 
     property var layout: ({})
     property int rowIndex: 0
-    readonly property bool hot: rowMouse.containsMouse || updateMouse.containsMouse || removeMouse.containsMouse
+    readonly property bool hot: rowMouse.containsMouse || updateMouse.containsMouse || removeMouse.containsMouse || autoMouse.containsMouse
 
     foreground: root.foreground
     hasCursor: root.mode === "list" && root.cursor === rowIndex
@@ -665,6 +668,7 @@ Panel {
             var n = 0
             for (var i = 0; i < screens.length; i++) n += screens[i].windows.length
             return screens.length + (screens.length === 1 ? " screen · " : " screens · ") + n + (n === 1 ? " window" : " windows")
+                   + (row.layout.auto ? (screens.length === 1 ? " · applied when it is the screen" : " · applied when they are the screens") : "")
           }
           color: root.dim
           font.family: root.fontFamily
@@ -673,6 +677,15 @@ Panel {
         Row {
           visible: row.hot || row.hasCursor
           spacing: Style.space(4)
+          PanelActionButton {
+            iconText: String.fromCodePoint(row.layout.auto ? 0xF0D4A : 0xF0379)
+            tooltipText: row.layout.auto ? "Applied by itself when these screens are connected: click to stop" : "Apply by itself when these screens are connected"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.body
+            onClicked: root.toggleAuto(row.layout)
+            MouseArea { id: autoMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+          }
           PanelActionButton {
             iconText: String.fromCodePoint(0xF0193)
             tooltipText: "Update with current windows"

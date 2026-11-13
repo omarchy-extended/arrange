@@ -13,3 +13,11 @@ if binds then
   end
   binds:close()
 end
+
+-- A layout that is its screens' own (omext-layout auto) is applied by itself
+-- when those screens are the ones connected: as a screen comes or goes, and at
+-- login. The tool waits for the change to settle, and runs once at a time.
+local function screens_changed() hl.exec_cmd(tool .. " screens") end
+hl.on("monitor.added", screens_changed)
+hl.on("monitor.removed", screens_changed)
+o.exec_on_start(tool .. " screens")

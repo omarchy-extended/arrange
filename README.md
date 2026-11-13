@@ -80,6 +80,20 @@ One menu for both: your layouts with a preview of every screen (click one, or
 press its number, to apply it), Save and Update, and each screen's zones (click
 a zone to put the active window there, or pick another set).
 
+## Layouts that apply by themselves
+
+A layout can be its screens' own: turn that on (the screen button on its row
+in the panel, or `a`), and it is applied whenever exactly the screens it was
+saved with are the ones connected. Plug the big screen in and the windows go
+back to their places there; unplug it and the laptop's layout takes over. Also
+at login.
+
+- One layout per set of screens: turning it on for one turns it off for another
+  saved with the same screens.
+- Applied this way nothing is started; only the windows that are open are
+  arranged.
+- From a script: `omext-layout auto <id> on|off|toggle`.
+
 ## Compatibility
 
 Needs **Omarchy 4.5** or later (tested on 4.5.0): it builds on its floating
