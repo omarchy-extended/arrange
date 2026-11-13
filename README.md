@@ -82,7 +82,9 @@ a zone to put the active window there, or pick another set).
 
 ## Arrange screens
 
-The panel's "Arrange screens" (or `s`) shows the connected screens as boxes.
+The panel's "Arrange screens" (or `s`) takes the panel's place with a view of
+its own (Back to layouts, or Esc, leaves it; the panel opens on its usual view
+again) and shows the connected screens as boxes.
 Drag one next to another: it lands beside the nearest, its edges in line with
 that one's when they are close, and never over another. Tab chooses a screen
 and the arrows move it; Enter applies, Esc leaves.

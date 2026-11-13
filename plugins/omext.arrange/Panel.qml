@@ -150,6 +150,10 @@ Panel {
   property var screensDraft: []      // [{name, description, x, y, w, h}], as they would be
   property bool screensKept: false   // an arrangement is kept for these screens
   property int screenSel: 0
+  // Arrange screens is a view of its own: it takes the panel's place (the
+  // layouts and the zones step aside), with a way back; the panel opens on its
+  // usual view again.
+  readonly property bool screensView: mode === "screens"
   // What the screens show (a laptop's with another connected): its own only,
   // the same on both, one desktop over both, the other only. "single": one screen.
   property string screensMode: "single"
@@ -381,22 +385,40 @@ Panel {
         id: flick
         anchors.fill: parent
         contentWidth: width
-        contentHeight: Math.max(column.implicitHeight, zoneCol.implicitHeight)
+        contentHeight: flick.cols2 ? Math.max(column.implicitHeight, zoneCol.implicitHeight) : column.implicitHeight
+        readonly property bool cols2: panel.twoCols && !root.screensView
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Row {
-          spacing: panel.twoCols ? panel.gap / 2 : 0  // either side of the line
+          spacing: flick.cols2 ? panel.gap / 2 : 0  // either side of the line
 
         Column {
           id: column
-          width: panel.twoCols ? Math.max(Style.space(380), flick.width - panel.gap - 1 - panel.zonesW) : flick.width
+          width: flick.cols2 ? Math.max(Style.space(380), flick.width - panel.gap - 1 - panel.zonesW) : flick.width
           spacing: Style.space(10)
 
+          // Arrange screens: back to the layouts.
+          Rectangle {
+            visible: root.screensView
+            width: backRow.implicitWidth + Style.space(20)
+            height: backRow.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius
+            color: backHit.containsMouse ? Util.alpha(root.foreground, 0.14) : Util.alpha(root.foreground, 0.06)
+            Row {
+              id: backRow
+              anchors.centerIn: parent
+              spacing: Style.space(6)
+              Text { text: String.fromCodePoint(0xF004D); color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body }
+              Text { text: "Back to layouts"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            }
+            MouseArea { id: backHit; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.cancel() }
+          }
+
           PanelSectionHeader {
-            text: "LAYOUTS"
+            text: root.screensView ? "ARRANGE SCREENS" : "LAYOUTS"
             foreground: root.foreground
             fontFamily: root.fontFamily
           }
@@ -412,7 +434,7 @@ Panel {
           }
 
           Text {
-            visible: root.layouts.length === 0
+            visible: root.layouts.length === 0 && !root.screensView
             width: parent.width
             text: "No layouts yet. Arrange your windows, then save them here."
             color: root.dim
@@ -422,6 +444,7 @@ Panel {
           }
 
           Column {
+            visible: !root.screensView
             width: parent.width
             spacing: Style.space(6)
 
@@ -564,7 +587,7 @@ Panel {
               Item {
                 id: screensMap
                 width: parent.width
-                height: Style.space(230)
+                height: Style.space(300)
                 readonly property real spanW: Math.max(1, Math.max.apply(null, [1].concat(root.screensDraft.map(s => s.x + s.w))))
                 readonly property real spanH: Math.max(1, Math.max.apply(null, [1].concat(root.screensDraft.map(s => s.y + s.h))))
                 // (Room around them: one being dragged past the others' edge stays in view.)
@@ -851,7 +874,7 @@ Panel {
 
         // Zones: each screen's zones and sets.
         Rectangle {  // between the columns
-          visible: panel.twoCols
+          visible: flick.cols2
           width: 1
           height: Math.max(column.implicitHeight, zoneCol.implicitHeight)
           color: Util.alpha(root.foreground, 0.12)
@@ -859,8 +882,8 @@ Panel {
 
         Column {
           id: zoneCol
-          visible: panel.twoCols
-          width: panel.twoCols ? flick.width - panel.gap - 1 - column.width : 0
+          visible: flick.cols2
+          width: flick.cols2 ? flick.width - panel.gap - 1 - column.width : 0
           spacing: Style.space(10)
 
           Item {
