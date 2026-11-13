@@ -108,6 +108,7 @@ Item {
   // icon: the map stands on the bar, clear of it).
   property string quickOn: ""
   property bool quickAbove: false
+  property string quickPinWord: ""   // from a taskbar's icon: "pin" or "unpin" (what the Pin line does), else none
   property var quickData: null
   property var quickHover: null    // { monitor, zone } under the pointer; zone -1 is Fill screen
 
@@ -117,6 +118,7 @@ Item {
     quickScreen = screen
     quickOn = screen
     quickAbove = false
+    quickPinWord = ""
     quickAt = Qt.point(parseInt(x) || 0, parseInt(y) || 0)
     quickHover = null
     quickData = null
@@ -130,6 +132,10 @@ Item {
     quick(addr, screen, x, y)
     quickOn = on || screen
     quickAbove = true
+  }
+  function quickPin(addr, screen, on, x, y, word) {
+    quickOver(addr, screen, on, x, y)
+    quickPinWord = word === "pin" || word === "unpin" ? word : ""
   }
   function quickDock(dock) {
     if (quickAddr) Quickshell.execDetached([docksTool, "send", "--dock", dock, "--window", quickAddr])
@@ -604,6 +610,7 @@ Item {
     function quick(address: string, screen: string, x: string, y: string): void { root.quick(address, screen, x, y) }
     // The map on screen `on`, standing on the point (x, y) there: for a window on `screen`.
     function quickOver(address: string, screen: string, on: string, x: string, y: string): void { root.quickOver(address, screen, on, x, y) }
+    function quickPin(address: string, screen: string, on: string, x: string, y: string, word: string): void { root.quickPin(address, screen, on, x, y, word) }
   }
 
   Process {
@@ -657,8 +664,9 @@ Item {
       x: quickPop.popMon ? Math.max(8, Math.min(quickPop.popMon.width - width - 8, root.quickAt.x - quickPop.popMon.x - width / 2)) : 0
       y: quickPop.popMon ? Math.max(8, Math.min(quickPop.popMon.height - height - 8,
            root.quickAt.y - quickPop.popMon.y + (root.quickAbove ? -height - 8 : 12))) : 0
+      readonly property int pinH: root.quickAbove && root.quickPinWord !== "" ? 18 + quickPop.pad / 2 : 0
       width: quickRow.implicitWidth + 2 * quickPop.pad
-      height: quickPop.boxH + quickPop.pad + (root.quickAbove ? 18 + quickPop.pad : 0)
+      height: quickPop.boxH + quickPop.pad + (root.quickAbove ? 18 + quickPop.pad : 0) + pinH
       radius: 10
       color: Commons.Util.alpha(Commons.Color.popups.background, 0.96)
       border.color: Commons.Util.alpha(root.accent, 0.6)
@@ -836,12 +844,42 @@ Item {
 
       // Opened from a taskbar's icon (not the window's own titlebar, which
       // has its buttons): the app can be quit from here too.
+      // ... and its app pinned to the taskbar, or taken off it.
+      Rectangle {
+        id: quickPinLine
+        visible: root.quickAbove && root.quickPinWord !== ""
+        readonly property bool lit: quickPinHit.containsMouse
+        x: quickPop.pad
+        y: quickPop.boxH + quickPop.pad / 2
+        width: quickBox.width - 2 * quickPop.pad
+        height: 18
+        radius: 5
+        color: lit ? Commons.Util.alpha(root.accent, 0.45) : Commons.Util.alpha(Commons.Color.foreground, 0.12)
+        border.width: 1
+        border.color: Commons.Util.alpha(root.accent, lit ? 1 : 0.4)
+        Text {
+          anchors.centerIn: parent
+          text: root.quickPinWord === "unpin" ? "\u{F0404}  Unpin from taskbar" : "\u{F0403}  Pin to taskbar"
+          color: Commons.Util.alpha(Commons.Color.foreground, parent.lit ? 1 : 0.7)
+          font.family: Commons.Style.font.family
+          font.pixelSize: 10
+        }
+        MouseArea {
+          id: quickPinHit
+          anchors.fill: parent
+          hoverEnabled: true
+          onClicked: {
+            if (root.quickAddr) Quickshell.execDetached(["omarchy-shell", "-q", "omext.taskbar", "pin", root.quickAddr])
+            root.closeQuick()
+          }
+        }
+      }
       Rectangle {
         id: quickClose
         visible: root.quickAbove
         readonly property bool lit: quickCloseHit.containsMouse
         x: quickPop.pad
-        y: quickPop.boxH + quickPop.pad / 2
+        y: quickPop.boxH + quickPop.pad / 2 + (quickPinLine.visible ? 18 + quickPop.pad / 2 : 0)
         width: quickBox.width - 2 * quickPop.pad
         height: 18
         radius: 5
