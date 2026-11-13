@@ -80,6 +80,20 @@ One menu for both: your layouts with a preview of every screen (click one, or
 press its number, to apply it), Save and Update, and each screen's zones (click
 a zone to put the active window there, or pick another set).
 
+## Arrange screens
+
+The panel's "Arrange screens" (or `s`) shows the connected screens as boxes.
+Drag one next to another: it lands beside the nearest, its edges in line with
+that one's when they are close, and never over another. Tab chooses a screen
+and the arrows move it; Enter applies, Esc leaves.
+
+The arrangement is kept for that set of screens (the laptop with the big
+screen at work is one set, the laptop with another screen at home another)
+and is in force again whenever that set is connected. Each screen keeps its
+resolution, scale and rotation. It is given to Hyprland after your own
+`monitors.lua`; the panel's forget button, or `omext-screens reset`, hands the
+screens back to that.
+
 ## Windows come back where they were
 
 A floating window that closes leaves its place behind for its app, and the

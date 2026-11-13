@@ -10,7 +10,7 @@ mark=omext-arrange
 
 omarchy plugin disable omext.arrange >/dev/null 2>&1
 omarchy plugin disable omext.zones >/dev/null 2>&1
-for f in "$bin/omext-layout" "$bin/omext-zone" "$plugins/omext.arrange" "$plugins/omext.zones"; do
+for f in "$bin/omext-layout" "$bin/omext-zone" "$bin/omext-screens" "$plugins/omext.arrange" "$plugins/omext.zones"; do
   [[ -L $f ]] && rm "$f"
 done
 [[ -f $hypr_conf ]] && sed -i "/^-- BEGIN $mark\$/,/^-- END $mark\$/d" "$hypr_conf"

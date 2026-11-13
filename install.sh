@@ -35,6 +35,7 @@ link() {  # link <source> <target>: ours, or nothing there yet
 }
 link "$dir/bin/omext-layout" "$bin/omext-layout"
 link "$dir/bin/omext-zone" "$bin/omext-zone"
+link "$dir/bin/omext-screens" "$bin/omext-screens"
 link "$dir/plugins/omext.arrange" "$plugins/omext.arrange"
 link "$dir/plugins/omext.zones" "$plugins/omext.zones"
 

@@ -141,6 +141,70 @@ Panel {
     keyCatcher.forceActiveFocus()
   }
 
+  // --- where the screens are -------------------------------------------------------
+  // Arrange screens: the connected screens as boxes to drag next to each other
+  // (omext-screens keeps the arrangement, per set of screens, and gives it to
+  // Hyprland). Dropped, a box goes to the nearest place beside another where
+  // it overlaps none, its edges in line with that one's when they are close.
+  readonly property string screensTool: Quickshell.env("HOME") + "/.local/bin/omext-screens"
+  property var screensDraft: []      // [{name, description, x, y, w, h}], as they would be
+  property bool screensKept: false   // an arrangement is kept for these screens
+  property int screenSel: 0
+  function startScreens() {
+    screensDraft = []
+    screensProc.running = false
+    screensProc.running = true
+    screenSel = 0
+    mode = "screens"
+  }
+  function snapScreen(i, x, y) {
+    var d = screensDraft.map(s => Object.assign({}, s)), r = d[i]
+    var others = d.filter((s, j) => j !== i)
+    if (!others.length) { r.x = 0; r.y = 0; screensDraft = d; return }
+    var near = 90, best = null
+    function hits(cx, cy) { return others.some(q => cx < q.x + q.w && q.x < cx + r.w && cy < q.y + q.h && q.y < cy + r.h) }
+    for (var o of others) {
+      // Along the other's side: in line with its edges or middle when close, else where dropped (still touching).
+      var ys = [o.y, o.y + o.h - r.h, o.y + (o.h - r.h) / 2], xs = [o.x, o.x + o.w - r.w, o.x + (o.w - r.w) / 2]
+      var ay = ys.find(v => Math.abs(v - y) < near), ax = xs.find(v => Math.abs(v - x) < near)
+      if (ay === undefined) ay = Math.max(o.y - r.h + 60, Math.min(o.y + o.h - 60, y))
+      if (ax === undefined) ax = Math.max(o.x - r.w + 60, Math.min(o.x + o.w - 60, x))
+      for (var c of [[o.x - r.w, ay], [o.x + o.w, ay], [ax, o.y - r.h], [ax, o.y + o.h]]) {
+        if (hits(c[0], c[1])) continue
+        var dist = Math.hypot(c[0] - x, c[1] - y)
+        if (!best || dist < best.dist) best = { x: Math.round(c[0]), y: Math.round(c[1]), dist: dist }
+      }
+    }
+    if (best) { r.x = best.x; r.y = best.y }
+    var left = Math.min.apply(null, d.map(s => s.x)), top = Math.min.apply(null, d.map(s => s.y))
+    for (var s of d) { s.x -= left; s.y -= top }
+    screensDraft = d
+  }
+  function nudgeScreen(dx, dy) {
+    var r = screensDraft[screenSel]
+    if (r) snapScreen(screenSel, r.x + dx * Math.max(200, r.w * 0.6), r.y + dy * Math.max(200, r.h * 0.6))
+  }
+  function applyScreens() {
+    if (!screensDraft.length) return
+    Quickshell.execDetached([screensTool, "set", JSON.stringify(screensDraft.map(s => ({ description: s.description, x: s.x, y: s.y })))])
+    cancel()
+  }
+  function resetScreens() {
+    Quickshell.execDetached([screensTool, "reset"])
+    cancel()
+  }
+  Process {
+    id: screensProc
+    command: [root.screensTool, "list"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { var got = JSON.parse(text); root.screensDraft = got.screens || []; root.screensKept = !!got.kept }
+        catch (e) { root.screensDraft = [] }
+      }
+    }
+  }
+
   // Breathing room on the left so the pill reads as its own group in the bar.
   readonly property real sidePadding: Style.space(root.setting("padding", 16))
 
@@ -273,17 +337,23 @@ Panel {
       anchors.fill: parent
       blocked: nameField.activeFocus
       onMoveRequested: function(dx, dy) {
+        if (root.mode === "screens") { root.nudgeScreen(dx, dy); return }
         if (root.mode === "list" && root.layouts.length > 0)
           root.cursor = Math.max(0, Math.min(root.layouts.length - 1, root.cursor + dy))
       }
       onActivateRequested: {
         if (root.mode === "confirm") root.confirm()
+        else if (root.mode === "screens") root.applyScreens()
         else if (root.mode === "list" && root.layouts.length > 0) root.applyLayout(root.layouts[root.cursor])
       }
       onDeleteRequested: if (root.mode === "list" && root.layouts.length > 0) root.askConfirm("remove", root.layouts[root.cursor])
       onCloseRequested: root.mode === "list" ? root.close() : root.cancel()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTabRequested: function(direction) {
+        if (root.mode === "screens" && root.screensDraft.length) { root.screenSel = (root.screenSel + direction + root.screensDraft.length) % root.screensDraft.length; return }
+        root.switchPanel(direction)
+      }
       onTextKey: function(t) {
+        if (root.mode === "list" && (t === "s" || t === "S")) { root.startScreens(); return }
         if (root.mode !== "list") return
         if (t >= "1" && t <= "9" && Number(t) <= root.layouts.length) root.applyLayout(root.layouts[Number(t) - 1])
         else if (t === "n" || t === "N") root.startSave()
@@ -386,6 +456,135 @@ Panel {
                 Button {
                   text: "Cancel"
                   onClicked: root.cancel()
+                }
+              }
+            }
+          }
+
+          // Arrange screens: the screens as boxes, to drag into place.
+          Rectangle {
+            visible: root.mode === "screens"
+            width: parent.width
+            implicitHeight: screensCol.implicitHeight + Style.space(20)
+            radius: Style.cornerRadius
+            color: Util.alpha(root.foreground, 0.06)
+
+            Column {
+              id: screensCol
+              anchors.fill: parent
+              anchors.margins: Style.space(10)
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "Drag the screens to where they stand next to each other"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Item {
+                id: screensMap
+                width: parent.width
+                height: Style.space(230)
+                readonly property real spanW: Math.max(1, Math.max.apply(null, [1].concat(root.screensDraft.map(s => s.x + s.w))))
+                readonly property real spanH: Math.max(1, Math.max.apply(null, [1].concat(root.screensDraft.map(s => s.y + s.h))))
+                // (Room around them: one being dragged past the others' edge stays in view.)
+                readonly property real k: Math.min((width * 0.7) / spanW, (height * 0.7) / spanH)
+                readonly property real ox: (width - spanW * k) / 2
+                readonly property real oy: (height - spanH * k) / 2
+                Rectangle { anchors.fill: parent; radius: Style.cornerRadius; color: Util.alpha(root.foreground, 0.04) }
+                Repeater {
+                  model: root.screensDraft
+                  Rectangle {
+                    id: box
+                    required property var modelData
+                    required property int index
+                    readonly property bool chosen: index === root.screenSel
+                    x: screensMap.ox + modelData.x * screensMap.k
+                    y: screensMap.oy + modelData.y * screensMap.k
+                    width: modelData.w * screensMap.k
+                    height: modelData.h * screensMap.k
+                    z: boxDrag.pressed ? 2 : chosen ? 1 : 0
+                    radius: 4
+                    color: Util.alpha(root.foreground, boxDrag.pressed ? 0.22 : chosen ? 0.16 : 0.09)
+                    border.width: chosen ? 2 : 1
+                    border.color: chosen ? Commons.Color.accent : Util.alpha(root.foreground, 0.35)
+                    Column {
+                      anchors.centerIn: parent
+                      width: parent.width - 8
+                      spacing: 2
+                      Text {
+                        width: parent.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: box.modelData.name
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                      }
+                      Text {
+                        width: parent.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: box.modelData.w + " × " + box.modelData.h
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                    MouseArea {
+                      id: boxDrag
+                      anchors.fill: parent
+                      cursorShape: Qt.SizeAllCursor
+                      drag.target: box
+                      drag.threshold: 2
+                      onPressed: root.screenSel = box.index
+                      // Let go: where it is on the map, in the screens' own pixels, then beside the nearest.
+                      onReleased: root.snapScreen(box.index, (box.x - screensMap.ox) / screensMap.k, (box.y - screensMap.oy) / screensMap.k)
+                    }
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: root.screensDraft.length < 2 ? "One screen is connected: there is nothing to arrange."
+                    : "Tab chooses a screen · the arrows move it · Enter applies · Esc leaves" + (root.screensKept ? " · kept for these screens" : "")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Row {
+                spacing: Style.space(8)
+                PanelActionButton {
+                  iconText: String.fromCodePoint(0xF012C)
+                  tooltipText: "Apply"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.body
+                  onClicked: root.applyScreens()
+                }
+                PanelActionButton {
+                  iconText: String.fromCodePoint(0xF0156)
+                  tooltipText: "Cancel"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.body
+                  onClicked: root.cancel()
+                }
+                PanelActionButton {
+                  visible: root.screensKept
+                  iconText: String.fromCodePoint(0xF0450)
+                  tooltipText: "Forget this arrangement (your own Hyprland config places them again)"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.body
+                  onClicked: root.resetScreens()
                 }
               }
             }
@@ -513,6 +712,52 @@ Panel {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: root.startSave()
+            }
+          }
+
+          // Footer: where the screens are.
+          CursorSurface {
+            visible: root.mode === "list"
+            width: parent.width
+            foreground: root.foreground
+            hasCursor: screensMouse.containsMouse
+            implicitHeight: screensRow.implicitHeight + Style.spacing.rowPaddingX
+
+            RowLayout {
+              id: screensRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(8)
+              Text {
+                text: String.fromCodePoint(0xF0379)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+              Text {
+                Layout.fillWidth: true
+                text: "Arrange screens"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              Text {
+                text: "s"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            MouseArea {
+              id: screensMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.startScreens()
             }
           }
 
