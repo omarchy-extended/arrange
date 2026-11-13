@@ -8,6 +8,8 @@ local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]+$") or "."
 local tool = here .. "/../bin/omext-screens"
 local state = os.getenv("XDG_STATE_HOME") or (os.getenv("HOME") .. "/.local/state")
 pcall(dofile, state .. "/omext/arrange/screens.lua")
+-- (The laptop's screen only: the other screens off, as chosen in the panel.)
+pcall(dofile, state .. "/omext/arrange/mode.lua")
 local function screens_changed() hl.exec_cmd(tool .. " apply") end
 hl.on("monitor.added", screens_changed)
 hl.on("monitor.removed", screens_changed)

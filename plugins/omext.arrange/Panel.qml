@@ -150,6 +150,20 @@ Panel {
   property var screensDraft: []      // [{name, description, x, y, w, h}], as they would be
   property bool screensKept: false   // an arrangement is kept for these screens
   property int screenSel: 0
+  // What the screens show (a laptop's with another connected): its own only,
+  // the same on both, one desktop over both, the other only. "single": one screen.
+  property string screensMode: "single"
+  readonly property var screenModes: [
+    { id: "pc", label: "Laptop only", glyph: 0xF0322 },
+    { id: "duplicate", label: "Duplicate", glyph: 0xF0A1A },
+    { id: "extend", label: "Extend", glyph: 0xF1928 },
+    { id: "second", label: "Second only", glyph: 0xF0379 }
+  ]
+  function setScreensMode(id) {
+    if (screensMode === "single" || id === screensMode) return
+    Quickshell.execDetached([screensTool, "mode", id])
+    close()
+  }
   function startScreens() {
     screensDraft = []
     screensProc.running = false
@@ -199,7 +213,7 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try { var got = JSON.parse(text); root.screensDraft = got.screens || []; root.screensKept = !!got.kept }
+        try { var got = JSON.parse(text); root.screensDraft = got.screens || []; root.screensKept = !!got.kept; root.screensMode = got.mode || "single" }
         catch (e) { root.screensDraft = [] }
       }
     }
@@ -354,6 +368,7 @@ Panel {
       }
       onTextKey: function(t) {
         if (root.mode === "list" && (t === "s" || t === "S")) { root.startScreens(); return }
+        if (root.mode === "screens" && t >= "1" && t <= "4") { root.setScreensMode(root.screenModes[Number(t) - 1].id); return }
         if (root.mode !== "list") return
         if (t >= "1" && t <= "9" && Number(t) <= root.layouts.length) root.applyLayout(root.layouts[Number(t) - 1])
         else if (t === "n" || t === "N") root.startSave()
@@ -474,6 +489,68 @@ Panel {
               anchors.fill: parent
               anchors.margins: Style.space(10)
               spacing: Style.space(8)
+
+              // Show on: the laptop's screen, the other, both.
+              Row {
+                id: modeRow
+                width: parent.width
+                spacing: Style.space(6)
+                opacity: root.screensMode === "single" ? 0.4 : 1
+                Repeater {
+                  model: root.screenModes
+                  Rectangle {
+                    id: chip
+                    required property var modelData
+                    required property int index
+                    readonly property bool now: root.screensMode === modelData.id
+                    width: (modeRow.width - modeRow.spacing * 3) / 4
+                    height: chipCol.implicitHeight + Style.space(14)
+                    radius: Style.cornerRadius
+                    color: now ? Util.alpha(Color.accent, 0.25) : chipHit.containsMouse && root.screensMode !== "single" ? Util.alpha(root.foreground, 0.12) : Util.alpha(root.foreground, 0.05)
+                    border.width: now ? 1 : 0
+                    border.color: Color.accent
+                    Column {
+                      id: chipCol
+                      anchors.centerIn: parent
+                      width: parent.width - Style.space(8)
+                      spacing: Style.space(3)
+                      Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: String.fromCodePoint(chip.modelData.glyph)
+                        color: chip.now ? Color.accent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body * 1.5
+                      }
+                      Text {
+                        width: parent.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: chip.modelData.label
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: String(chip.index + 1)
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                    MouseArea { id: chipHit; anchors.fill: parent; hoverEnabled: true; onClicked: root.setScreensMode(chip.modelData.id) }
+                  }
+                }
+              }
+              Text {
+                visible: root.screensMode === "single"
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "With another screen connected to a laptop: which of them show the desktop."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
 
               Text {
                 width: parent.width

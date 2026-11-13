@@ -94,6 +94,26 @@ resolution, scale and rotation. It is given to Hyprland after your own
 `monitors.lua`; the panel's forget button, or `omext-screens reset`, hands the
 screens back to that.
 
+### Which screens show the desktop
+
+On a laptop with another screen connected, the same view has four choices
+above the boxes (keys `1` to `4`), the one in force marked:
+
+| | |
+|---|---|
+| Laptop only | The other screens are off. |
+| Duplicate | The same picture on both. |
+| Extend | One desktop over both (the usual). |
+| Second only | The laptop's own screen is off. |
+
+Duplicate, Extend and Second only are Omarchy's own switches
+(`omarchy hyprland monitor internal ...`), so its recovery when the screen is
+unplugged follows. Laptop only turns the other screens off by their
+description: another screen on the same plug still comes on, and if the
+laptop's own screen is not there to show anything they come back by
+themselves. From a script: `omext-screens mode`, `omext-screens mode
+pc|duplicate|extend|second`.
+
 ## Windows come back where they were
 
 A floating window that closes leaves its place behind for its app, and the

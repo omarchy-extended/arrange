@@ -12,6 +12,11 @@ Usage:
                                  the arrangement kept for the set connected, if there is one
   omext-screens reset            forget the arrangement kept for the screens connected
                                  (your own Hyprland config places them again)
+  omext-screens mode             JSON: what the screens show now ("mode": pc, duplicate,
+                                 extend, second; or single, with one screen connected)
+  omext-screens mode <pc|duplicate|extend|second>
+                                 the laptop's screen only, the same on both, one desktop
+                                 over both, or the other screen only
 
 An arrangement is kept per set of screens (the laptop with the big screen at
 work is one, the laptop with another screen at home another), in
@@ -19,11 +24,20 @@ work is one, the laptop with another screen at home another), in
 file of its own that the addon's hypr/screens.lua loads after your own
 monitors.lua; each rule keeps the screen's mode, scale and rotation as they
 are. Screens may not overlap, and are moved so the top left one is at 0, 0.
+
+The modes are a laptop's with another screen connected. Duplicate, extend and
+second-screen-only are Omarchy's own switches (omarchy hyprland monitor
+internal ...), so its keys and its recovery when the screen is unplugged
+follow; the laptop's screen only is a rule of this tool's (the other screens
+off, by their description, so another screen on the same plug still comes on).
 """
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CORE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy" / "plugins" / "omext.core"
@@ -36,6 +50,9 @@ except ImportError:
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omext" / "screens.json"
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omext" / "arrange"
 RULES = STATE / "screens.lua"
+ONLY = STATE / "mode.lua"   # the laptop's screen only: the other screens off
+TOGGLES = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omarchy" / "toggles" / "hypr"
+MODES = ("pc", "duplicate", "extend", "second")
 
 
 def die(msg):
@@ -95,7 +112,7 @@ def cmd_list():
         w, h = logical(m)
         out.append({"name": m["name"], "description": name_of(m), "x": m["x"], "y": m["y"], "w": w, "h": h,
                     "scale": m["scale"], "focused": bool(m.get("focused"))})
-    print(json.dumps({"screens": out, "kept": bool(kept)}, ensure_ascii=False))
+    print(json.dumps({"screens": out, "kept": bool(kept), "mode": mode_now()}, ensure_ascii=False))
 
 
 def cmd_set(args):
@@ -127,6 +144,11 @@ def cmd_set(args):
 
 
 def cmd_apply():
+    # The other screens are off by this tool, and the laptop's is not there to
+    # show anything (lid closed, or off): they come back on.
+    inside, _ = every_screen()
+    if (not inside or inside.get("disabled")) and only_off():
+        reload()
     monitors = hypr("monitors")
     places = (settings.read(CONFIG, {}) or {}).get(key_of(monitors))
     if places:
@@ -136,6 +158,83 @@ def cmd_apply():
     elif write_rules([]):
         # Rules from another set of screens were in force: your own config's again.
         subprocess.run(["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def every_screen():
+    """The screens connected, the ones turned off too: the laptop's own, the others."""
+    found = [m for m in json.loads(subprocess.run(["hyprctl", "monitors", "all", "-j"], capture_output=True, text=True,
+                                                  check=True).stdout) if m["name"] != "FALLBACK"]
+    own = os.environ.get("OMEXT_INTERNAL")  # (a laptop screen under another name)
+    inside = next((m for m in found if (m["name"] == own if own else re.match(r"(eDP|LVDS|DSI)-", m["name"]))), None)
+    return inside, [m for m in found if m is not inside]
+
+
+def mode_now():
+    inside, others = every_screen()
+    if not inside or not others:
+        return "single"
+    if inside.get("disabled"):
+        return "second"
+    if all(m.get("disabled") for m in others):
+        return "pc"
+    if any(m.get("mirrorOf") not in (None, "", "none") for m in [inside] + others):
+        return "duplicate"
+    return "extend"
+
+
+def reload():
+    subprocess.run(["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.2)  # the screens come and go: what is asked next sees them as they are
+
+
+def omarchy(*args):
+    subprocess.run(list(args), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def only_off():
+    """The other screens back on, if this tool had them off."""
+    if ONLY.exists() and "hl.monitor" in ONLY.read_text():
+        ONLY.write_text("-- Written by omext-screens (the laptop's screen only); see omext-screens --help.\n")
+        return True
+    return False
+
+
+def cmd_mode(args):
+    if not args:
+        inside, others = every_screen()
+        print(json.dumps({"mode": mode_now(), "internal": inside["name"] if inside else None,
+                          "others": [m["name"] for m in others]}))
+        return
+    want = args[0]
+    if want not in MODES:
+        die("mode is one of " + ", ".join(MODES))
+    inside, others = every_screen()
+    if not inside or not others:
+        die("a laptop's screen and another one are needed for that")
+    if not shutil.which("omarchy-hyprland-monitor-internal"):
+        die("needs Omarchy's own screen switches (omarchy-hyprland-monitor-internal)")
+    if want == mode_now():
+        return
+    mirror, off = TOGGLES / "internal-monitor-mirror.lua", TOGGLES / "internal-monitor-disable.lua"
+    changed = only_off() if want != "pc" else False
+    if mirror.exists() and want != "duplicate":
+        omarchy("omarchy-hyprland-monitor-internal-mirror", "off")
+        changed = True
+    if off.exists() and want != "second":
+        omarchy("omarchy-hyprland-monitor-internal", "on")
+        changed = True
+    if changed:
+        reload()
+    if want == "duplicate":
+        omarchy("omarchy-hyprland-monitor-internal-mirror", "on")
+    elif want == "second":
+        omarchy("omarchy-hyprland-monitor-internal", "off")
+    elif want == "pc":
+        STATE.mkdir(parents=True, exist_ok=True)
+        lines = ["hl.monitor({ output = " + lua("desc:" + m["description"] if m.get("description") else m["name"]) +
+                 ", disabled = true })" for m in others]
+        ONLY.write_text("-- Written by omext-screens (the laptop's screen only); see omext-screens --help.\n" + "\n".join(lines) + "\n")
+        reload()
 
 
 def cmd_reset():
@@ -161,6 +260,8 @@ def main():
         cmd_apply()
     elif cmd == "reset":
         cmd_reset()
+    elif cmd == "mode":
+        cmd_mode(rest)
     else:
         die(f"unknown command {cmd}")
 
