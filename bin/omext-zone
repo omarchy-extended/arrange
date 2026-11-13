@@ -23,6 +23,10 @@ Usage:
                                        in fractions of the free area), and give it to the screen
   omext-zone delete <name>               drop a set of your own
   omext-zone hide|show <name>            leave a set out of the picker's row, or put it back
+  omext-zone remember <window JSON>      a floating window just closed: where it was is kept
+                                       for its app (the omext.zones plugin calls this)
+  omext-zone recall <address>            a window just opened: back where its app's window
+                                       last was (the plugin calls this too)
 
 Without --window it is the active window. Each screen has one set of zones, by
 default "thirds" on wide screens and "halves" on the others; the choice is kept
@@ -258,6 +262,116 @@ def place(c, rect):
     dispatch(f"hl.dsp.window.alter_zorder({{ mode = 'top', window = {addr} }})")
 
 
+# --- where an app's window was -------------------------------------------------
+# A floating window that closes leaves its place behind, for its app: the zone
+# (or zones) it filled, or where it stood free. The next window of that app to
+# open goes back there: into the zone, if the screen's zones now still have
+# that number; else to where it stood. Only the first window of an app: one
+# opened while another is up is placed as any new window. Kept per set of
+# screens connected (the laptop alone, the laptop and the big one), in
+# ~/.local/state/omext/arrange/places.json. Docked windows are the docks'.
+PLACES = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omext" / "arrange" / "places.json"
+ZONE_SLACK = 24  # px each edge may be off from a zone (a window's minimum size)
+DOCKED_TAG = "omext-docked"
+
+
+def screens_key(monitors):
+    return "|".join(sorted(m.get("description") or m["name"] for m in monitors))
+
+
+def app_key(c):
+    return str(c.get("class") or c.get("initialClass") or "").lower()
+
+
+def zones_filled(c, rects):
+    """The zones (1-based) the window fills: its frame matches one, or the box
+    around several. None for one placed by hand."""
+    fr = frame(c)
+
+    def inside(z):
+        w = min(z[0] + z[2], fr[0] + fr[2]) - max(z[0], fr[0])
+        h = min(z[1] + z[3], fr[1] + fr[3]) - max(z[1], fr[1])
+        return max(0, w) * max(0, h) >= 0.6 * z[2] * z[3]
+    picked = [i for i, z in enumerate(rects) if inside(z)]
+    if not picked:
+        return None
+    box = union([rects[i] for i in picked])
+    edges = zip((box[0], box[1], box[0] + box[2], box[1] + box[3]), (fr[0], fr[1], fr[0] + fr[2], fr[1] + fr[3]))
+    return [i + 1 for i in picked] if all(abs(a - b) <= ZONE_SLACK for a, b in edges) else None
+
+
+def its_own(c):
+    """A window whose place is kept: floating, on a workspace, not a dock's."""
+    return bool(c.get("floating")) and c.get("workspace", {}).get("id", -1) > 0 and not c.get("fullscreen") \
+        and DOCKED_TAG not in c.get("tags", []) and bool(app_key(c))
+
+
+def cmd_remember(args):
+    try:
+        c = json.loads(args[0])
+    except (IndexError, ValueError):
+        die("remember needs the window, as hyprctl clients -j gives it")
+    if not its_own(c):
+        return
+    monitors = hypr("monitors")
+    m = next((x for x in monitors if x["id"] == c.get("monitor")), None)
+    if not m:
+        return
+    ax, ay, aw, ah = free_area(m)
+    fr = frame(c)
+    places = read_json(PLACES) or {}
+    places.setdefault(screens_key(monitors), {})[app_key(c)] = {
+        "monitor": m.get("description") or m["name"], "zones": zones_filled(c, zones(m)),
+        "rect": [round((fr[0] - ax) / aw, 4), round((fr[1] - ay) / ah, 4), round(fr[2] / aw, 4), round(fr[3] / ah, 4)],
+        "t": int(time.time())}
+    PLACES.parent.mkdir(parents=True, exist_ok=True)
+    write_json(PLACES, places)
+
+
+def cmd_recall(args):
+    if not args:
+        die("recall needs a window's address")
+    addr = args[0] if args[0].startswith("0x") else "0x" + args[0]
+    clients = hypr("clients")
+    c = next((x for x in clients if x["address"] == addr), None)
+    if not c:
+        return
+    # An app a dock has: the docks take its new window in a moment (unless it
+    # was opened to be a window of its own). Looked at once they have.
+    docks = read_json(Path(os.environ.get("OMEXT_DOCKS_FILE") or Path.home() / ".config/omext/docks.json")) or {}
+    theirs = set()
+    for d in docks.get("docks", []):
+        for a in d.get("apps", []):
+            cls = a.get("class") or []
+            theirs |= {x.lower() for x in ([cls] if isinstance(cls, str) else cls)}
+    if app_key(c) in theirs:
+        time.sleep(0.7)
+        clients = hypr("clients")
+        c = next((x for x in clients if x["address"] == addr), None)
+    if not c or not its_own(c):
+        return
+    if any(x["address"] != addr and app_key(x) == app_key(c) and x.get("mapped", True) for x in clients):
+        return  # not its app's first window: as any new one
+    monitors = hypr("monitors")
+    was = ((read_json(PLACES) or {}).get(screens_key(monitors)) or {}).get(app_key(c))
+    if not was:
+        return
+    m = next((x for x in monitors if (x.get("description") or x["name"]) == was.get("monitor")), None) or monitor_of(c, monitors)
+    if m["id"] != c["monitor"]:
+        dispatch(f"hl.dsp.window.move({{ workspace = {q(m['activeWorkspace']['name'])}, follow = false, window = {q('address:' + addr)} }})")
+    rects = zones(m)
+    picks = was.get("zones") or []
+    if picks and all(1 <= n <= len(rects) for n in picks):
+        place(c, union([rects[n - 1] for n in picks]))   # its zone, as the screen's zones are now
+        return
+    ax, ay, aw, ah = free_area(m)   # no such zone now (or it stood free): where it stood
+    fx, fy, fw, fh = was["rect"]
+    w, h = min(round(fw * aw), aw), min(round(fh * ah), ah)
+    x = min(max(round(ax + fx * aw), ax), ax + aw - w)
+    y = min(max(round(ay + fy * ah), ay), ay + ah - h)
+    place(c, [x, y, w, h])
+
+
 def cmd_list():
     out = []
     for m in hypr("monitors"):
@@ -491,7 +605,8 @@ def main():
                 "use": lambda: cmd_use(rest), "pick": lambda: cmd_pick(rest),
                 "quick": lambda: cmd_quick(rest),
                 "save": lambda: cmd_save(rest), "delete": lambda: cmd_delete(rest),
-                "hide": lambda: cmd_hide(rest, True), "show": lambda: cmd_hide(rest, False)}
+                "hide": lambda: cmd_hide(rest, True), "show": lambda: cmd_hide(rest, False),
+                "remember": lambda: cmd_remember(rest), "recall": lambda: cmd_recall(rest)}
     if cmd not in commands:
         die(f"unknown command {cmd}")
     commands[cmd]()

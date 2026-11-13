@@ -590,6 +590,45 @@ Item {
     }
   }
 
+  // --- where an app's window was ----------------------------------------------------
+  // A floating window that closes leaves its place for its app, and the app's
+  // next window goes back there (omext-zone remember / recall do the work:
+  // see there). A window is gone by the time Hyprland says it closed, so the
+  // windows are kept as last seen here, and that is what is handed on.
+  // "remember": false in ~/.config/omext/zones-settings.json turns it off.
+  property var seen: ({})      // address -> the window, as hyprctl clients -j gave it
+  property var opened: []      // just opened: recalled once Omarchy has placed them
+  Loader { id: placesSet; Component.onCompleted: setSource("file://" + (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy/plugins/omext.core/Settings.qml", { name: "zones-settings" }) }
+  readonly property bool remembers: !placesSet.item || placesSet.item.values.remember !== false
+  Process {
+    id: seenProc
+    command: ["hyprctl", "clients", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { var m = {}; for (var c of JSON.parse(text)) m[c.address] = c; root.seen = m } catch (e) {} }
+    }
+  }
+  Timer { interval: 3000; running: root.remembers; repeat: true; triggeredOnStart: true; onTriggered: if (!seenProc.running) seenProc.running = true }
+  Timer { id: seenSoon; interval: 80; onTriggered: if (!seenProc.running) seenProc.running = true }
+  Timer {
+    id: recallSoon
+    interval: 350
+    onTriggered: { var a = root.opened; root.opened = []; for (var addr of a) Quickshell.execDetached([root.tool, "recall", addr]) }
+  }
+  Connections {
+    target: Hyprland
+    enabled: root.remembers
+    function onRawEvent(event) {
+      var name = String(event.name), data = String(event.data || "")
+      if (name === "openwindow") { root.opened = root.opened.concat(["0x" + data.split(",")[0]]); recallSoon.restart() }
+      else if (name === "closewindow") {
+        var c = root.seen["0x" + data.trim()]
+        if (c) Quickshell.execDetached([root.tool, "remember", JSON.stringify(c)])
+      }
+      if (/^(openwindow|closewindow|movewindow|activewindow|changefloatingmode|fullscreen)/.test(name)) seenSoon.restart()
+    }
+  }
+
   // Escape (omext core's bind): the zone map goes.
   GlobalShortcut { appid: "omext"; name: "escape-zones"; description: "Close the zone map"; onPressed: root.closeQuick() }
 

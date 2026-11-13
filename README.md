@@ -80,6 +80,28 @@ One menu for both: your layouts with a preview of every screen (click one, or
 press its number, to apply it), Save and Update, and each screen's zones (click
 a zone to put the active window there, or pick another set).
 
+## Windows come back where they were
+
+A floating window that closes leaves its place behind for its app, and the
+app's next window opens there:
+
+- in the zone (or zones) it filled, if the screen's zones still have that
+  number;
+- else where it stood, floating. A window you placed by hand comes back to
+  that spot and size.
+
+Only the first window of an app goes back; a second one, opened while the
+first is up, is placed as any new window. Places are kept per set of screens
+(the laptop alone, the laptop and a big screen), so a window never comes back
+on a screen that isn't there. Windows in an
+[omext dock](https://github.com/omarchy-extended/docks) are the dock's.
+
+To turn it off:
+
+```bash
+omext-settings set zones-settings remember false
+```
+
 ## Layouts that apply by themselves
 
 A layout can be its screens' own: turn that on (the screen button on its row
