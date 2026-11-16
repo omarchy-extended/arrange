@@ -301,9 +301,11 @@ def zones_filled(c, rects):
 
 
 def its_own(c):
-    """A window whose place is kept: floating, on a workspace, not a dock's."""
+    """A window whose place is kept: floating, on a workspace, not a dock's, not a
+    portal dialog. The portal's file pickers belong to whichever app asked, and
+    Omarchy centers them; moving one to where the last one stood made it jump."""
     return bool(c.get("floating")) and c.get("workspace", {}).get("id", -1) > 0 and not c.get("fullscreen") \
-        and DOCKED_TAG not in c.get("tags", []) and bool(app_key(c))
+        and DOCKED_TAG not in c.get("tags", []) and bool(app_key(c)) and not app_key(c).startswith("xdg-desktop-portal")
 
 
 def cmd_remember(args):
