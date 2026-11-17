@@ -382,7 +382,26 @@ Item {
     return -1
   }
 
+  // The watcher's calls each come in their own process and can overtake each
+  // other (a drag's end before its start would leave the snap bar up). Each
+  // carries a number that only grows: one older than the last taken is dropped.
+  property real dragSeq: 0
+  function dragFresh(seq) {
+    var n = Number(seq)
+    if (!(n > dragSeq)) return false
+    dragSeq = n
+    return true
+  }
+  // No word from the watcher for a while (it says a drag goes on every second):
+  // the drag is over, its end lost. The snap bar goes, nothing is snapped.
+  Timer {
+    id: dragWatch
+    interval: 4000
+    onTriggered: if (root.dragged !== "") { root.hover = null; root.dragEnd() }
+  }
+
   function dragStart(addr) {
+    dragWatch.restart()
     dragged = addr.startsWith("0x") ? addr : "0x" + addr
     dragWide = false
     dragHeld = false
@@ -638,13 +657,15 @@ Item {
     function pickOn(address: string, screen: string): void { root.pickOn(address, screen) }
     function editOn(screen: string, how: string): void { root.editOn(screen, how) }
     function close(): void { root.close(); root.closeQuick() }
-    function dragStart(address: string): void { root.dragStart(address) }
+    // The drag calls end in the watcher's number (see dragFresh).
+    function dragStart(address: string, seq: string): void { if (root.dragFresh(seq)) root.dragStart(address) }
     // ... with Shift held already: the zones over the whole screen from the start.
-    function dragStartWide(address: string): void { root.dragStart(address); root.dragWide = true }
-    function dragEnd(): void { root.dragEnd() }
+    function dragStartWide(address: string, seq: string): void { if (root.dragFresh(seq)) { root.dragStart(address); root.dragWide = true } }
+    function dragEnd(seq: string): void { if (root.dragFresh(seq)) root.dragEnd() }
     // Called off (Shift let go of with the button held): the window goes nowhere.
-    function dragCancel(): void { root.hover = null; root.dragEnd() }
-    function dragWide(on: string): void { if (root.dragged !== "") { root.dragHeld = false; root.hover = null; root.dragWide = on === "on" } }
+    function dragCancel(seq: string): void { if (root.dragFresh(seq)) { root.hover = null; root.dragEnd() } }
+    function dragAlive(seq: string): void { if (root.dragFresh(seq) && root.dragged !== "") dragWatch.restart() }
+    function dragWide(on: string, seq: string): void { if (root.dragFresh(seq) && root.dragged !== "") { root.dragHeld = false; root.hover = null; root.dragWide = on === "on" } }
     function dragHold(): void { if (root.dragged !== "") root.dragHeld = true }
     function quick(address: string, screen: string, x: string, y: string): void { root.quick(address, screen, x, y) }
     // The map on screen `on`, standing on the point (x, y) there: for a window on `screen`.

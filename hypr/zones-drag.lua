@@ -31,9 +31,22 @@ local probe = nil         -- a question asked last tick: { x, y, cx, cy, why }
 local resuming = 0        -- looks left of that moment
 
 
+-- Each call is its own omarchy-shell process (about a second to get through),
+-- so a quick drag's start and end can arrive the wrong way round, and the snap
+-- bar would stay. Every call carries a number that only grows, also across
+-- config reloads (it starts from the clock); the shell drops any call older
+-- than the last one it took.
+omext_zone_drag_seq = math.max(omext_zone_drag_seq or 0, os.time() * 1000)
+
 local function shell(call)
-  hl.exec_cmd("omarchy-shell omext.zones " .. call)
+  omext_zone_drag_seq = omext_zone_drag_seq + 1
+  hl.exec_cmd("omarchy-shell -q omext.zones " .. call .. string.format(" %d", omext_zone_drag_seq))
 end
+
+-- While a drag goes on it is said again every second; a shell that hears
+-- nothing for a while puts the snap bar away (a call can also get lost).
+local ALIVE = 20          -- looks between (1 s)
+local alive = 0
 
 local function shift_down()
   local ok, a = pcall(hl.is_key_down, "Shift_L")
@@ -65,11 +78,38 @@ local function drop()
   shell("dragEnd")
 end
 
+-- Screens coming and going (waking after the lock screen, a dock plugged in)
+-- move windows and the pointer together, which looks like a drag. For a moment
+-- after, nothing starts one, and one going on is called off.
+local QUIET = 40          -- looks (2 s) without new drags after the screens change
+local quiet = 0
+
+local function screens_changed()
+  quiet = QUIET
+  if dragging then
+    over()
+    shell("dragCancel")
+  end
+  last, cancelled, probe = nil, false, nil
+end
+for _, event in ipairs({ "monitor.added", "monitor.removed", "monitor.layout_changed" }) do
+  pcall(hl.on, event, screens_changed)
+end
+
+-- A config reload can start this file over with a drag still shown: the drop
+-- for it would never come, and the snap bar would stay. Whatever was shown goes.
+shell("dragCancel")
+
 -- One watcher, also after a config reload that keeps the Lua state.
 if omext_zone_drag then
   pcall(function() omext_zone_drag:set_enabled(false) end)
 end
 omext_zone_drag = hl.timer(function()
+  if quiet > 0 then
+    quiet = quiet - 1
+    last = nil
+    return
+  end
   local win = hl.get_active_window()
   local cursor = hl.get_cursor_pos()
   if not (win and win.floating and cursor) then
@@ -118,7 +158,7 @@ omext_zone_drag = hl.timer(function()
     -- (A drag whose zones were put away with Shift is a plain move from then
     -- on: nothing shows, unless Shift is held again.)
     if with_pointer and (not cancelled or shift_down()) then
-      dragging, cancelled, still, away = true, false, 0, 0
+      dragging, cancelled, still, away, alive = true, false, 0, 0, 0
       wide = shift_down()
       -- (One call: two would race, and the view asked for could arrive first
       -- and be undone by the start.)
@@ -145,6 +185,11 @@ omext_zone_drag = hl.timer(function()
       resuming, away, still = 12, 0, 0
     end
     if resuming > 0 then resuming = resuming - 1 end
+    alive = alive + 1
+    if alive >= ALIVE then
+      alive = 0
+      shell("dragAlive")
+    end
     if with_pointer then
       resuming = 0
       still, away = 0, 0
